@@ -42,27 +42,33 @@ bash install_jetson.sh
 python3 jetson_gradio_app.py --no-flash-attn
 
 # 或指定模型路径
-python3 jetson_gradio_app.py ~/models/Qwen3-TTS-0.6B --no-flash-attn --dtype float16
+python3 jetson_gradio_app.py ./Qwen__Qwen3-TTS-12Hz-0.6B-Base --no-flash-attn --dtype float16
 ```
 
 访问 `http://<jetson-ip>:8000`
 
 如果本地没有模型，程序会自动显示下载界面，可以：
-- 查看已检测到的本地缓存模型
-- 选择模型并下载到默认缓存或自定义目录
+- 查看已检测到的本地模型
+- 选择模型并下载到当前目录(默认)或自定义目录
 - 手动指定已有模型的路径
 
 ### 5. 手动下载模型 (可选)
 
-如果希望提前下载模型：
+如果希望提前下载模型(与应用默认目录一致)：
 
 ```bash
 # 使用 ModelScope (国内)
 pip install modelscope
-modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-Base --local_dir ~/models/Qwen3-TTS-0.6B
+modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-Base --local_dir ./Qwen__Qwen3-TTS-12Hz-0.6B-Base
 
 # 或使用 HuggingFace
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base --local-dir ~/models/Qwen3-TTS-0.6B
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base --local-dir ./Qwen__Qwen3-TTS-12Hz-0.6B-Base
+```
+
+如需自定义下载根目录，可设置环境变量：
+
+```bash
+export QWEN3_TTS_DOWNLOAD_DIR=/path/to/models
 ```
 
 ## 手动安装 (可选)
@@ -85,8 +91,9 @@ pip install -e ./Qwen3-TTS
 
 程序会自动扫描以下位置查找已下载的模型：
 
-- 环境变量指定的目录: `HF_HOME`, `HUGGINGFACE_HUB_CACHE`, `TRANSFORMERS_CACHE`
-- 默认缓存目录: `~/.cache/huggingface/hub`
+- 当前工作目录下的默认下载子目录(或 `QWEN3_TTS_DOWNLOAD_DIR`)
+- 环境变量指定的 HuggingFace 目录: `HF_HOME`, `HUGGINGFACE_HUB_CACHE`, `TRANSFORMERS_CACHE`
+- HuggingFace 默认缓存目录: `~/.cache/huggingface/hub`
 - 命令行指定的路径
 
 支持的模型：

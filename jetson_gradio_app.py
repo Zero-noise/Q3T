@@ -52,6 +52,40 @@ def _format_bytes(num_bytes: Optional[int]) -> str:
     return f"{size:.2f} TiB"
 
 
+def _get_default_download_root() -> Path:
+    env_root = os.getenv("QWEN3_TTS_DOWNLOAD_DIR")
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
+def _get_default_download_dir(repo_id: str) -> Path:
+    safe_repo = repo_id.replace("/", "__")
+    return _get_default_download_root() / safe_repo
+
+
+def _coerce_int(value: Optional[float], default: int) -> int:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, float) and np.isnan(value):
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _coerce_float(value: Optional[float], default: float) -> float:
+    try:
+        if value is None:
+            return default
+        if isinstance(value, float) and np.isnan(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
 def _read_meminfo() -> Dict[str, int]:
     meminfo: Dict[str, int] = {}
     try:
@@ -128,6 +162,12 @@ SUPPORTED_MODELS = [
 ]
 
 
+def _validate_model_dir(model_dir: Path) -> Tuple[bool, bool]:
+    has_config = (model_dir / "config.json").exists()
+    has_weights = any(model_dir.glob("*.safetensors")) or any(model_dir.glob("*.bin"))
+    return has_config, has_weights
+
+
 def _get_hf_cache_dirs() -> List[Path]:
     """获取 HuggingFace 常见的缓存目录列表"""
     cache_dirs = []
@@ -145,24 +185,27 @@ def _get_hf_cache_dirs() -> List[Path]:
     if transformers_cache:
         cache_dirs.append(Path(transformers_cache))
 
-    # 2. 默认缓存目录
+    # 2. 默认缓存目录 (基于当前用户主目录)
     home = Path.home()
     default_dirs = [
         home / ".cache" / "huggingface" / "hub",
         home / ".cache" / "huggingface" / "transformers",
         home / ".huggingface" / "hub",
-        Path("/root/.cache/huggingface/hub"),  # Docker/root 环境
     ]
     cache_dirs.extend(default_dirs)
 
-    # 3. 去重并只返回存在的目录
+    # 3. 去重并只返回存在且可访问的目录
     seen = set()
     result = []
     for d in cache_dirs:
-        d = d.resolve()
-        if d not in seen and d.exists():
-            seen.add(d)
-            result.append(d)
+        try:
+            d = d.resolve()
+            if d not in seen and d.exists():
+                seen.add(d)
+                result.append(d)
+        except (PermissionError, OSError):
+            # 跳过无权限访问的目录
+            continue
     return result
 
 
@@ -172,20 +215,23 @@ def _find_model_in_hf_cache(repo_id: str) -> Optional[Path]:
     cache_folder_name = "models--" + repo_id.replace("/", "--")
 
     for cache_dir in _get_hf_cache_dirs():
-        model_cache = cache_dir / cache_folder_name
-        if model_cache.exists():
-            # 检查 snapshots 目录
-            snapshots = model_cache / "snapshots"
-            if snapshots.exists():
-                # 返回最新的 snapshot
-                snapshot_dirs = sorted(snapshots.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)
-                for snap in snapshot_dirs:
-                    if snap.is_dir():
-                        # 验证是否有必要的文件
-                        has_config = (snap / "config.json").exists()
-                        has_weights = any(snap.glob("*.safetensors")) or any(snap.glob("*.bin"))
-                        if has_config and has_weights:
-                            return snap
+        try:
+            model_cache = cache_dir / cache_folder_name
+            if model_cache.exists():
+                # 检查 snapshots 目录
+                snapshots = model_cache / "snapshots"
+                if snapshots.exists():
+                    # 返回最新的 snapshot
+                    snapshot_dirs = sorted(snapshots.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)
+                    for snap in snapshot_dirs:
+                        if snap.is_dir():
+                            # 验证是否有必要的文件
+                            has_config, has_weights = _validate_model_dir(snap)
+                            if has_config and has_weights:
+                                return snap
+        except (PermissionError, OSError):
+            # 跳过无权限访问的目录
+            continue
     return None
 
 
@@ -194,15 +240,20 @@ def _check_model_downloaded(checkpoint: str) -> Dict[str, Any]:
     if os.path.exists(checkpoint):
         ckpt_path = Path(checkpoint)
         if ckpt_path.is_file():
-            return {"status": "local_file", "path": str(ckpt_path)}
-        if ckpt_path.is_dir():
-            has_config = (ckpt_path / "config.json").exists()
-            has_weights = any(ckpt_path.glob("*.safetensors")) or any(ckpt_path.glob("*.bin"))
             return {
-                "status": "local_dir",
+                "status": "local_file",
+                "path": str(ckpt_path),
+                "error": "checkpoint 必须是目录或 HuggingFace repo id",
+            }
+        if ckpt_path.is_dir():
+            has_config, has_weights = _validate_model_dir(ckpt_path)
+            status = "local_dir" if (has_config and has_weights) else "local_dir_invalid"
+            return {
+                "status": status,
                 "path": str(ckpt_path),
                 "has_config": has_config,
                 "has_weights": has_weights,
+                "error": "模型目录缺少 config.json 或权重文件" if status == "local_dir_invalid" else None,
             }
         return {"status": "local_missing", "path": str(ckpt_path)}
 
@@ -215,11 +266,37 @@ def _check_model_downloaded(checkpoint: str) -> Dict[str, Any]:
             local_files_only=True,
             allow_patterns=["*.safetensors", "*.bin", "config.json", "generation_config.json", "*.json"],
         )
-        return {"status": "cached", "path": repo_dir}
+        repo_dir = Path(repo_dir)
+        has_config, has_weights = _validate_model_dir(repo_dir)
+        if has_config and has_weights:
+            return {"status": "cached", "path": str(repo_dir)}
+        return {
+            "status": "cached_invalid",
+            "path": str(repo_dir),
+            "has_config": has_config,
+            "has_weights": has_weights,
+            "error": "缓存模型缺少 config.json 或权重文件",
+        }
     except Exception:
         pass
 
-    # 3. 手动搜索 HuggingFace 缓存目录
+    # 3. 检查当前目录下的默认下载位置
+    try:
+        local_dir = _get_default_download_dir(checkpoint)
+        if local_dir.exists():
+            has_config, has_weights = _validate_model_dir(local_dir)
+            status = "local_dir" if (has_config and has_weights) else "local_dir_invalid"
+            return {
+                "status": status,
+                "path": str(local_dir),
+                "has_config": has_config,
+                "has_weights": has_weights,
+                "error": "模型目录缺少 config.json 或权重文件" if status == "local_dir_invalid" else None,
+            }
+    except Exception:
+        pass
+
+    # 4. 手动搜索 HuggingFace 缓存目录
     found_path = _find_model_in_hf_cache(checkpoint)
     if found_path:
         return {"status": "cached", "path": str(found_path)}
@@ -265,12 +342,16 @@ def _system_check_summary(checkpoint: str, output_dir: str) -> str:
 
     lines = []
     lines.append(f"模型检查: {model.get('status')}")
-    if model.get("status") == "local_dir":
+    if model.get("status") in {"local_dir", "local_dir_invalid", "cached_invalid"}:
         lines.append(f"- 路径: {model.get('path')}")
         lines.append(f"- config.json: {model.get('has_config')}")
         lines.append(f"- 权重文件: {model.get('has_weights')}")
+        if model.get("error"):
+            lines.append(f"- 错误: {model.get('error')}")
     elif model.get("status") in {"local_file", "cached"}:
         lines.append(f"- 路径: {model.get('path')}")
+        if model.get("error"):
+            lines.append(f"- 错误: {model.get('error')}")
     elif model.get("status") == "not_cached":
         lines.append("- 未在本地缓存检测到模型，可提前离线下载")
 
@@ -362,11 +443,11 @@ def _build_base_ui(tts: Qwen3TTSModel, output_dir: str, save_audio: bool):
                 return None, "ICL 模式需要参考文本"
 
             gen_kwargs = _collect_gen_kwargs(
-                int(max_new_tokens_in),
-                float(temperature_in),
-                int(top_k_in),
-                float(top_p_in),
-                float(repetition_penalty_in),
+                _coerce_int(max_new_tokens_in, 1024),
+                _coerce_float(temperature_in, 0.8),
+                _coerce_int(top_k_in, 50),
+                _coerce_float(top_p_in, 0.9),
+                _coerce_float(repetition_penalty_in, 1.05),
             )
             wavs, sr = tts.generate_voice_clone(
                 text=text_in,
@@ -434,11 +515,11 @@ def _build_custom_ui(tts: Qwen3TTSModel, output_dir: str, save_audio: bool):
                 return None, "请选择 speaker"
 
             gen_kwargs = _collect_gen_kwargs(
-                int(max_new_tokens_in),
-                float(temperature_in),
-                int(top_k_in),
-                float(top_p_in),
-                float(repetition_penalty_in),
+                _coerce_int(max_new_tokens_in, 1024),
+                _coerce_float(temperature_in, 0.8),
+                _coerce_int(top_k_in, 50),
+                _coerce_float(top_p_in, 0.9),
+                _coerce_float(repetition_penalty_in, 1.05),
             )
             wavs, sr = tts.generate_custom_voice(
                 text=text_in,
@@ -498,11 +579,11 @@ def _build_voice_design_ui(tts: Qwen3TTSModel, output_dir: str, save_audio: bool
             repetition_penalty_in: float,
         ) -> Tuple[Optional[Tuple[int, Any]], str]:
             gen_kwargs = _collect_gen_kwargs(
-                int(max_new_tokens_in),
-                float(temperature_in),
-                int(top_k_in),
-                float(top_p_in),
-                float(repetition_penalty_in),
+                _coerce_int(max_new_tokens_in, 1024),
+                _coerce_float(temperature_in, 0.8),
+                _coerce_int(top_k_in, 50),
+                _coerce_float(top_p_in, 0.9),
+                _coerce_float(repetition_penalty_in, 1.05),
             )
             wavs, sr = tts.generate_voice_design(
                 text=text_in,
@@ -537,7 +618,7 @@ def _scan_all_cached_models() -> List[Dict[str, Any]]:
     found = []
     for repo_id in SUPPORTED_MODELS:
         result = _check_model_downloaded(repo_id)
-        if result["status"] in ("cached", "local_dir", "local_file"):
+        if result["status"] in ("cached", "local_dir"):
             found.append({
                 "repo_id": repo_id,
                 "path": result.get("path", ""),
@@ -558,12 +639,28 @@ def _download_model(repo_id: str, local_dir: Optional[str], progress=gr.Progress
     try:
         kwargs = {
             "repo_id": repo_id,
-            "allow_patterns": ["*.safetensors", "*.bin", "*.json", "*.txt", "*.model"],
+            "allow_patterns": [
+                "*.safetensors",
+                "*.bin",
+                "*.pt",
+                "*.npz",
+                "*.json",
+                "*.jsonl",
+                "*.txt",
+                "*.model",
+                "*.vocab",
+                "*.tiktoken",
+                "*.spm",
+                "*.sentencepiece",
+                "*.merges",
+            ],
         }
         if local_dir and local_dir.strip():
             local_path = Path(local_dir).expanduser().resolve()
-            local_path.mkdir(parents=True, exist_ok=True)
-            kwargs["local_dir"] = str(local_path)
+        else:
+            local_path = _get_default_download_dir(repo_id)
+        local_path.mkdir(parents=True, exist_ok=True)
+        kwargs["local_dir"] = str(local_path)
 
         progress(0.1, desc="正在下载模型文件...")
         result_path = snapshot_download(**kwargs)
@@ -600,11 +697,9 @@ def build_download_ui() -> gr.Blocks:
                 info="选择要下载的 Qwen3-TTS 模型"
             )
 
-            # HuggingFace 缓存目录信息
-            cache_dirs = _get_hf_cache_dirs()
-            default_cache = str(cache_dirs[0]) if cache_dirs else str(Path.home() / ".cache" / "huggingface" / "hub")
-
-            gr.Markdown(f"**默认缓存目录**: `{default_cache}`")
+            default_root = _get_default_download_root()
+            gr.Markdown(f"**默认下载目录**: `{default_root}`")
+            gr.Markdown("将自动在当前目录下为每个模型创建子目录。")
 
             use_custom_dir = gr.Checkbox(label="使用自定义下载目录", value=False)
             custom_dir = gr.Textbox(
@@ -645,7 +740,7 @@ def build_download_ui() -> gr.Blocks:
                 if not path or not path.strip():
                     return "请输入路径"
                 result = _check_model_downloaded(path.strip())
-                if result["status"] in ("local_dir", "local_file", "cached"):
+                if result["status"] in ("local_dir", "cached"):
                     return f"检测到有效模型!\n路径: {result.get('path', path)}\n\n启动命令:\npython jetson_gradio_app.py {result.get('path', path)}"
                 return f"未检测到有效模型\n状态: {result['status']}\n错误: {result.get('error', '路径不存在或缺少必要文件')}"
 
@@ -777,6 +872,12 @@ def main(argv=None) -> int:
 
     # 检查指定的 checkpoint 是否有效
     model_status = _check_model_downloaded(checkpoint)
+    if model_status["status"] in {"local_file", "local_dir_invalid", "cached_invalid", "local_missing"}:
+        print(f"错误: 指定的模型路径无效: {checkpoint}")
+        if model_status.get("error"):
+            print(f"原因: {model_status['error']}")
+        print("请提供模型目录或 HuggingFace repo id。")
+        return 1
     if model_status["status"] == "not_cached":
         print(f"警告: 指定的模型 '{checkpoint}' 未在本地找到。")
         print("尝试从 HuggingFace 下载模型...")
