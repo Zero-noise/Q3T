@@ -828,12 +828,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _auto_detect_model() -> Optional[str]:
-    """自动检测已缓存的模型，返回第一个可用的模型路径"""
-    cached = _scan_all_cached_models()
-    if cached:
-        return cached[0]["path"]
-    return None
+def _scan_local_models() -> List[Dict[str, Any]]:
+    """扫描当前目录下已下载的模型"""
+    found = []
+    for repo_id in SUPPORTED_MODELS:
+        local_dir = _get_default_download_dir(repo_id)
+        if local_dir.exists():
+            has_config, has_weights = _validate_model_dir(local_dir)
+            if has_config and has_weights:
+                found.append({
+                    "repo_id": repo_id,
+                    "path": str(local_dir),
+                    "status": "local_dir",
+                })
+    return found
 
 
 def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
@@ -843,23 +851,38 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
     output_dir = _ensure_output_dir(args.output_dir)
     save_audio = not args.no_save
 
+    # 启动时扫描当前目录下的模型
+    local_models = _scan_local_models()
+    initial_status = "模型未加载。请选择模型后点击「下载模型」或「加载模型」。"
+    default_model = SUPPORTED_MODELS[0]
+    default_path = ""
+
+    if local_models:
+        # 找到本地模型，设置为默认
+        first_local = local_models[0]
+        default_model = first_local["repo_id"]
+        default_path = first_local["path"]
+        model_list = "\n".join([f"  - {m['repo_id']}: {m['path']}" for m in local_models])
+        initial_status = f"检测到本地已下载的模型:\n{model_list}\n\n可以直接点击「加载模型」"
+
     with gr.Blocks(css=".gradio-container {max-width: 100% !important;}") as demo:
         gr.Markdown("# Qwen3-TTS Jetson Orin Gradio Demo")
         gr.Markdown("请先下载或选择模型，然后点击「加载模型」按钮。")
 
         # ===== 模型管理区域 =====
-        with gr.Accordion("模型管理", open=True) as model_accordion:
+        with gr.Accordion("模型管理", open=True):
             # 模型选择
             with gr.Row():
                 model_dropdown = gr.Dropdown(
                     label="选择模型",
                     choices=SUPPORTED_MODELS,
-                    value=SUPPORTED_MODELS[0],
+                    value=default_model,
                     info="选择要下载/加载的模型"
                 )
                 local_path_input = gr.Textbox(
                     label="或输入本地路径",
                     placeholder="留空使用上方选择的模型",
+                    value=default_path,
                     scale=2
                 )
 
@@ -872,7 +895,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 label="模型状态",
                 lines=4,
                 interactive=False,
-                value="模型未加载。请选择模型后点击「下载模型」或「加载模型」。"
+                value=initial_status
             )
 
             # 检查本地是否已有模型
