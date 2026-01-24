@@ -35,7 +35,26 @@ bash install_jetson.sh
 
 脚本会自动安装 PyTorch、torchaudio 和所有依赖。运行时选择 **选项 1** (Jetson AI Lab PyPI)。
 
-### 4. 下载模型
+### 4. 运行
+
+```bash
+# 直接启动 - 自动检测本地模型或显示下载界面
+python3 jetson_gradio_app.py --no-flash-attn
+
+# 或指定模型路径
+python3 jetson_gradio_app.py ~/models/Qwen3-TTS-0.6B --no-flash-attn --dtype float16
+```
+
+访问 `http://<jetson-ip>:8000`
+
+如果本地没有模型，程序会自动显示下载界面，可以：
+- 查看已检测到的本地缓存模型
+- 选择模型并下载到默认缓存或自定义目录
+- 手动指定已有模型的路径
+
+### 5. 手动下载模型 (可选)
+
+如果希望提前下载模型：
 
 ```bash
 # 使用 ModelScope (国内)
@@ -45,14 +64,6 @@ modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-Base --local_dir ~/models/Q
 # 或使用 HuggingFace
 huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base --local-dir ~/models/Qwen3-TTS-0.6B
 ```
-
-### 5. 运行
-
-```bash
-python3 jetson_gradio_app.py ~/models/Qwen3-TTS-0.6B --no-flash-attn --dtype float16
-```
-
-访问 `http://<jetson-ip>:8000`
 
 ## 手动安装 (可选)
 
@@ -70,12 +81,28 @@ pip install transformers==4.57.3 accelerate==1.12.0 gradio librosa soundfile
 pip install -e ./Qwen3-TTS
 ```
 
+## 自动模型检测
+
+程序会自动扫描以下位置查找已下载的模型：
+
+- 环境变量指定的目录: `HF_HOME`, `HUGGINGFACE_HUB_CACHE`, `TRANSFORMERS_CACHE`
+- 默认缓存目录: `~/.cache/huggingface/hub`
+- 命令行指定的路径
+
+支持的模型：
+- `Qwen/Qwen3-TTS-12Hz-0.6B-Base` - 语音克隆
+- `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` - 预定义说话人
+- `Qwen/Qwen3-TTS-12Hz-0.6B-VoiceDesign` - 文字描述控制风格
+- `Qwen/Qwen3-TTS-25Hz-0.6B-*` - 25Hz 版本 (质量更高)
+
 ## 模型选择
 
 | 模型 | 显存 | 兼容性 |
 |-----|------|-------|
 | 0.6B-Base / CustomVoice | ~1.5 GB | ✅ 推荐 |
 | 1.7B 系列 | ~4 GB | ⚠️ 需 16GB+ |
+
+**12Hz vs 25Hz**: 12Hz 模型推理更快，25Hz 模型音质更高
 
 ## 故障排除
 

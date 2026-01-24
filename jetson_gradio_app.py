@@ -117,7 +117,80 @@ def _check_cuda_mem() -> Dict[str, Optional[int]]:
     return {"total": None, "free": None, "used": None}
 
 
+# 支持的 Qwen3-TTS 模型列表
+SUPPORTED_MODELS = [
+    "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "Qwen/Qwen3-TTS-12Hz-0.6B-VoiceDesign",
+    "Qwen/Qwen3-TTS-25Hz-0.6B-Base",
+    "Qwen/Qwen3-TTS-25Hz-0.6B-CustomVoice",
+    "Qwen/Qwen3-TTS-25Hz-0.6B-VoiceDesign",
+]
+
+
+def _get_hf_cache_dirs() -> List[Path]:
+    """获取 HuggingFace 常见的缓存目录列表"""
+    cache_dirs = []
+
+    # 1. 环境变量指定的缓存目录
+    hf_home = os.getenv("HF_HOME")
+    if hf_home:
+        cache_dirs.append(Path(hf_home) / "hub")
+
+    hf_cache = os.getenv("HUGGINGFACE_HUB_CACHE")
+    if hf_cache:
+        cache_dirs.append(Path(hf_cache))
+
+    transformers_cache = os.getenv("TRANSFORMERS_CACHE")
+    if transformers_cache:
+        cache_dirs.append(Path(transformers_cache))
+
+    # 2. 默认缓存目录
+    home = Path.home()
+    default_dirs = [
+        home / ".cache" / "huggingface" / "hub",
+        home / ".cache" / "huggingface" / "transformers",
+        home / ".huggingface" / "hub",
+        Path("/root/.cache/huggingface/hub"),  # Docker/root 环境
+    ]
+    cache_dirs.extend(default_dirs)
+
+    # 3. 去重并只返回存在的目录
+    seen = set()
+    result = []
+    for d in cache_dirs:
+        d = d.resolve()
+        if d not in seen and d.exists():
+            seen.add(d)
+            result.append(d)
+    return result
+
+
+def _find_model_in_hf_cache(repo_id: str) -> Optional[Path]:
+    """在 HuggingFace 缓存目录中查找模型"""
+    # HuggingFace 缓存使用 models--org--name 格式
+    cache_folder_name = "models--" + repo_id.replace("/", "--")
+
+    for cache_dir in _get_hf_cache_dirs():
+        model_cache = cache_dir / cache_folder_name
+        if model_cache.exists():
+            # 检查 snapshots 目录
+            snapshots = model_cache / "snapshots"
+            if snapshots.exists():
+                # 返回最新的 snapshot
+                snapshot_dirs = sorted(snapshots.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)
+                for snap in snapshot_dirs:
+                    if snap.is_dir():
+                        # 验证是否有必要的文件
+                        has_config = (snap / "config.json").exists()
+                        has_weights = any(snap.glob("*.safetensors")) or any(snap.glob("*.bin"))
+                        if has_config and has_weights:
+                            return snap
+    return None
+
+
 def _check_model_downloaded(checkpoint: str) -> Dict[str, Any]:
+    # 1. 检查是否是本地路径
     if os.path.exists(checkpoint):
         ckpt_path = Path(checkpoint)
         if ckpt_path.is_file():
@@ -133,6 +206,7 @@ def _check_model_downloaded(checkpoint: str) -> Dict[str, Any]:
             }
         return {"status": "local_missing", "path": str(ckpt_path)}
 
+    # 2. 尝试使用 huggingface_hub 的 local_files_only 模式
     try:
         from huggingface_hub import snapshot_download
 
@@ -142,8 +216,15 @@ def _check_model_downloaded(checkpoint: str) -> Dict[str, Any]:
             allow_patterns=["*.safetensors", "*.bin", "config.json", "generation_config.json", "*.json"],
         )
         return {"status": "cached", "path": repo_dir}
-    except Exception as e:
-        return {"status": "not_cached", "error": str(e)}
+    except Exception:
+        pass
+
+    # 3. 手动搜索 HuggingFace 缓存目录
+    found_path = _find_model_in_hf_cache(checkpoint)
+    if found_path:
+        return {"status": "cached", "path": str(found_path)}
+
+    return {"status": "not_cached", "error": "模型未在本地找到"}
 
 
 def _ensure_output_dir(output_dir: str) -> str:
@@ -451,6 +532,141 @@ def _build_voice_design_ui(tts: Qwen3TTSModel, output_dir: str, save_audio: bool
         )
 
 
+def _scan_all_cached_models() -> List[Dict[str, Any]]:
+    """扫描所有已缓存的 Qwen3-TTS 模型"""
+    found = []
+    for repo_id in SUPPORTED_MODELS:
+        result = _check_model_downloaded(repo_id)
+        if result["status"] in ("cached", "local_dir", "local_file"):
+            found.append({
+                "repo_id": repo_id,
+                "path": result.get("path", ""),
+                "status": result["status"],
+            })
+    return found
+
+
+def _download_model(repo_id: str, local_dir: Optional[str], progress=gr.Progress()) -> str:
+    """下载模型到指定目录"""
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return "错误: 请先安装 huggingface_hub: pip install huggingface_hub"
+
+    progress(0, desc=f"开始下载 {repo_id}...")
+
+    try:
+        kwargs = {
+            "repo_id": repo_id,
+            "allow_patterns": ["*.safetensors", "*.bin", "*.json", "*.txt", "*.model"],
+        }
+        if local_dir and local_dir.strip():
+            local_path = Path(local_dir).expanduser().resolve()
+            local_path.mkdir(parents=True, exist_ok=True)
+            kwargs["local_dir"] = str(local_path)
+
+        progress(0.1, desc="正在下载模型文件...")
+        result_path = snapshot_download(**kwargs)
+        progress(1.0, desc="下载完成!")
+        return f"下载成功!\n模型路径: {result_path}\n\n请重启应用并使用以下命令:\npython jetson_gradio_app.py {result_path}"
+    except Exception as e:
+        return f"下载失败: {str(e)}"
+
+
+def build_download_ui() -> gr.Blocks:
+    """构建模型下载界面"""
+    with gr.Blocks(css=".gradio-container {max-width: 100% !important;}") as demo:
+        gr.Markdown("# Qwen3-TTS 模型下载器")
+        gr.Markdown("检测到本地没有可用的模型，请先下载模型。")
+
+        # 显示已缓存的模型
+        cached_models = _scan_all_cached_models()
+        if cached_models:
+            with gr.Accordion("已检测到的本地模型", open=True):
+                cached_info = "\n".join([f"- **{m['repo_id']}**\n  路径: `{m['path']}`" for m in cached_models])
+                gr.Markdown(cached_info)
+                gr.Markdown("可以使用以下命令直接启动:")
+                for m in cached_models:
+                    gr.Code(f"python jetson_gradio_app.py {m['path']}", language="bash")
+
+        # 下载新模型
+        with gr.Accordion("下载新模型", open=not cached_models):
+            gr.Markdown("### 选择要下载的模型")
+
+            model_choice = gr.Dropdown(
+                label="模型",
+                choices=SUPPORTED_MODELS,
+                value=SUPPORTED_MODELS[0],
+                info="选择要下载的 Qwen3-TTS 模型"
+            )
+
+            # HuggingFace 缓存目录信息
+            cache_dirs = _get_hf_cache_dirs()
+            default_cache = str(cache_dirs[0]) if cache_dirs else str(Path.home() / ".cache" / "huggingface" / "hub")
+
+            gr.Markdown(f"**默认缓存目录**: `{default_cache}`")
+
+            use_custom_dir = gr.Checkbox(label="使用自定义下载目录", value=False)
+            custom_dir = gr.Textbox(
+                label="自定义目录 (留空使用默认缓存)",
+                placeholder=f"例如: ~/models/Qwen3-TTS-0.6B",
+                visible=False
+            )
+
+            def toggle_custom_dir(use_custom):
+                return gr.update(visible=use_custom)
+
+            use_custom_dir.change(toggle_custom_dir, inputs=[use_custom_dir], outputs=[custom_dir])
+
+            download_btn = gr.Button("开始下载", variant="primary")
+            download_status = gr.Textbox(label="下载状态", lines=6, interactive=False)
+
+            def do_download(model, use_custom, custom_path, progress=gr.Progress()):
+                local_dir = custom_path if use_custom and custom_path.strip() else None
+                return _download_model(model, local_dir, progress)
+
+            download_btn.click(
+                do_download,
+                inputs=[model_choice, use_custom_dir, custom_dir],
+                outputs=[download_status]
+            )
+
+        # 手动指定模型路径
+        with gr.Accordion("手动指定本地模型路径", open=False):
+            gr.Markdown("如果模型已经下载到其他位置，可以直接指定路径启动:")
+            manual_path = gr.Textbox(
+                label="模型路径",
+                placeholder="例如: /path/to/Qwen3-TTS-12Hz-0.6B-Base"
+            )
+            check_btn = gr.Button("检查路径")
+            check_result = gr.Textbox(label="检查结果", lines=4, interactive=False)
+
+            def check_manual_path(path):
+                if not path or not path.strip():
+                    return "请输入路径"
+                result = _check_model_downloaded(path.strip())
+                if result["status"] in ("local_dir", "local_file", "cached"):
+                    return f"检测到有效模型!\n路径: {result.get('path', path)}\n\n启动命令:\npython jetson_gradio_app.py {result.get('path', path)}"
+                return f"未检测到有效模型\n状态: {result['status']}\n错误: {result.get('error', '路径不存在或缺少必要文件')}"
+
+            check_btn.click(check_manual_path, inputs=[manual_path], outputs=[check_result])
+
+        gr.Markdown("---")
+        gr.Markdown("### 使用说明")
+        gr.Markdown("""
+1. 选择要下载的模型类型:
+   - **Base**: 语音克隆模型，需要参考音频
+   - **CustomVoice**: 预定义说话人模型
+   - **VoiceDesign**: 通过文字描述控制语音风格
+
+2. **12Hz vs 25Hz**: 12Hz 模型更快，25Hz 模型质量更高
+
+3. 下载完成后，使用显示的命令重启应用
+        """)
+
+    return demo
+
+
 def build_demo(tts: Qwen3TTSModel, checkpoint: str, output_dir: str, save_audio: bool) -> gr.Blocks:
     with gr.Blocks(css=".gradio-container {max-width: 100% !important;}") as demo:
         gr.Markdown("# Qwen3-TTS Jetson Orin Gradio Demo")
@@ -483,7 +699,12 @@ def build_demo(tts: Qwen3TTSModel, checkpoint: str, output_dir: str, save_audio:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Qwen3-TTS Gradio demo for Jetson Orin.")
-    parser.add_argument("checkpoint", help="Model checkpoint path or HuggingFace repo id.")
+    parser.add_argument(
+        "checkpoint",
+        nargs="?",
+        default=None,
+        help="Model checkpoint path or HuggingFace repo id. If not provided, will auto-detect or show download UI.",
+    )
     parser.add_argument("--device", default="cuda:0", help="Device for device_map (default: cuda:0).")
     parser.add_argument(
         "--dtype",
@@ -504,16 +725,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ssl-keyfile", default=None, help="Path to SSL key file for HTTPS.")
     parser.add_argument("--output-dir", default="outputs", help="Directory to save generated audio.")
     parser.add_argument("--no-save", action="store_true", help="Disable saving generated audio.")
+    parser.add_argument(
+        "--auto-detect",
+        action="store_true",
+        help="Auto-detect and use the first available cached model.",
+    )
     return parser
+
+
+def _auto_detect_model() -> Optional[str]:
+    """自动检测已缓存的模型，返回第一个可用的模型路径"""
+    cached = _scan_all_cached_models()
+    if cached:
+        return cached[0]["path"]
+    return None
 
 
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-
-    output_dir = _ensure_output_dir(args.output_dir)
-    tts = _load_tts(args)
-    demo = build_demo(tts, args.checkpoint, output_dir, save_audio=not args.no_save)
 
     launch_kwargs: Dict[str, Any] = dict(
         server_name=args.ip,
@@ -524,6 +754,37 @@ def main(argv=None) -> int:
         launch_kwargs["ssl_certfile"] = args.ssl_certfile
     if args.ssl_keyfile:
         launch_kwargs["ssl_keyfile"] = args.ssl_keyfile
+
+    checkpoint = args.checkpoint
+
+    # 如果没有指定 checkpoint，尝试自动检测
+    if checkpoint is None or args.auto_detect:
+        print("正在扫描本地模型缓存...")
+        auto_path = _auto_detect_model()
+        if auto_path:
+            print(f"检测到已缓存的模型: {auto_path}")
+            if checkpoint is None:
+                checkpoint = auto_path
+        else:
+            print("未检测到本地模型，将显示下载界面。")
+
+    # 如果仍然没有 checkpoint，显示下载界面
+    if checkpoint is None:
+        print("启动模型下载界面...")
+        demo = build_download_ui()
+        demo.queue(default_concurrency_limit=int(args.concurrency)).launch(**launch_kwargs)
+        return 0
+
+    # 检查指定的 checkpoint 是否有效
+    model_status = _check_model_downloaded(checkpoint)
+    if model_status["status"] == "not_cached":
+        print(f"警告: 指定的模型 '{checkpoint}' 未在本地找到。")
+        print("尝试从 HuggingFace 下载模型...")
+
+    output_dir = _ensure_output_dir(args.output_dir)
+    args.checkpoint = checkpoint  # 更新 args 以便 _load_tts 使用
+    tts = _load_tts(args)
+    demo = build_demo(tts, checkpoint, output_dir, save_audio=not args.no_save)
 
     demo.queue(default_concurrency_limit=int(args.concurrency)).launch(**launch_kwargs)
     return 0
