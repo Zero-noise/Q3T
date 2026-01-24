@@ -836,6 +836,312 @@ def _auto_detect_model() -> Optional[str]:
     return None
 
 
+def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
+    """构建延迟加载模型的界面 - 先启动UI，后加载模型"""
+    # 使用可变容器存储模型状态
+    state = {"tts": None, "checkpoint": None, "model_type": None}
+    output_dir = _ensure_output_dir(args.output_dir)
+    save_audio = not args.no_save
+
+    with gr.Blocks(css=".gradio-container {max-width: 100% !important;}") as demo:
+        gr.Markdown("# Qwen3-TTS Jetson Orin Gradio Demo")
+        gr.Markdown("请先下载或选择模型，然后点击「加载模型」按钮。")
+
+        # ===== 模型管理区域 =====
+        with gr.Accordion("模型管理", open=True) as model_accordion:
+            # 模型选择
+            with gr.Row():
+                model_dropdown = gr.Dropdown(
+                    label="选择模型",
+                    choices=SUPPORTED_MODELS,
+                    value=SUPPORTED_MODELS[0],
+                    info="选择要下载/加载的模型"
+                )
+                local_path_input = gr.Textbox(
+                    label="或输入本地路径",
+                    placeholder="留空使用上方选择的模型",
+                    scale=2
+                )
+
+            # 下载按钮和状态
+            with gr.Row():
+                download_btn = gr.Button("下载模型", variant="secondary")
+                load_btn = gr.Button("加载模型", variant="primary")
+
+            model_status_text = gr.Textbox(
+                label="模型状态",
+                lines=4,
+                interactive=False,
+                value="模型未加载。请选择模型后点击「下载模型」或「加载模型」。"
+            )
+
+            # 检查本地是否已有模型
+            def check_local_model(repo_id: str, local_path: str) -> str:
+                path_to_check = local_path.strip() if local_path.strip() else repo_id
+                # 先检查当前目录下的模型
+                local_dir = _get_default_download_dir(path_to_check) if not local_path.strip() else Path(local_path)
+                if local_dir.exists():
+                    has_config, has_weights = _validate_model_dir(local_dir)
+                    if has_config and has_weights:
+                        return f"检测到本地模型: {local_dir}\n可以直接点击「加载模型」"
+                result = _check_model_downloaded(path_to_check)
+                if result["status"] in ("cached", "local_dir"):
+                    return f"检测到缓存模型: {result.get('path', path_to_check)}\n可以直接点击「加载模型」"
+                return f"模型未下载。点击「下载模型」开始下载到当前目录。"
+
+            model_dropdown.change(
+                check_local_model,
+                inputs=[model_dropdown, local_path_input],
+                outputs=[model_status_text]
+            )
+
+            # 下载模型函数
+            def do_download(repo_id: str, local_path: str, progress=gr.Progress()):
+                target_path = local_path.strip() if local_path.strip() else None
+                return _download_model(repo_id, target_path, progress)
+
+            download_btn.click(
+                do_download,
+                inputs=[model_dropdown, local_path_input],
+                outputs=[model_status_text]
+            )
+
+        # ===== TTS 生成区域 (初始隐藏) =====
+        with gr.Column(visible=False) as tts_area:
+            with gr.Accordion("System Checks", open=False):
+                sys_info = gr.Textbox(label="状态", lines=8, value="")
+                refresh_btn = gr.Button("刷新检查")
+
+            # Base 模式 UI
+            with gr.Tab("Base (Voice Clone)", visible=False) as base_tab:
+                base_text = gr.Textbox(label="Text", lines=4, placeholder="请输入要合成的文本")
+                base_language = gr.Textbox(label="Language (Auto/English/Chinese/...)", value="Auto")
+                base_ref_audio = gr.Audio(label="Reference Audio (wav)", type="filepath")
+                base_ref_text = gr.Textbox(label="Reference Text (required if not x-vector only)", lines=3)
+                base_xvec_only = gr.Checkbox(label="X-vector only (no ref text)", value=False)
+                with gr.Row():
+                    base_max_tokens = gr.Number(label="max_new_tokens", value=1024, precision=0)
+                    base_temp = gr.Number(label="temperature", value=0.8)
+                    base_top_k = gr.Number(label="top_k", value=50, precision=0)
+                    base_top_p = gr.Number(label="top_p", value=0.9)
+                    base_rep_pen = gr.Number(label="repetition_penalty", value=1.05)
+                base_gen_btn = gr.Button("Generate")
+                base_audio_out = gr.Audio(label="Output", type="numpy")
+                base_status = gr.Textbox(label="Status")
+
+            # CustomVoice 模式 UI
+            with gr.Tab("CustomVoice", visible=False) as custom_tab:
+                custom_text = gr.Textbox(label="Text", lines=4, placeholder="请输入要合成的文本")
+                custom_language = gr.Textbox(label="Language (Auto/English/Chinese/...)", value="Auto")
+                custom_speaker = gr.Dropdown(label="Speaker", choices=[], value=None)
+                custom_instruct = gr.Textbox(label="Instruction (optional)", lines=3)
+                with gr.Row():
+                    custom_max_tokens = gr.Number(label="max_new_tokens", value=1024, precision=0)
+                    custom_temp = gr.Number(label="temperature", value=0.8)
+                    custom_top_k = gr.Number(label="top_k", value=50, precision=0)
+                    custom_top_p = gr.Number(label="top_p", value=0.9)
+                    custom_rep_pen = gr.Number(label="repetition_penalty", value=1.05)
+                custom_gen_btn = gr.Button("Generate")
+                custom_audio_out = gr.Audio(label="Output", type="numpy")
+                custom_status = gr.Textbox(label="Status")
+
+            # VoiceDesign 模式 UI
+            with gr.Tab("VoiceDesign", visible=False) as design_tab:
+                design_text = gr.Textbox(label="Text", lines=4, placeholder="请输入要合成的文本")
+                design_language = gr.Textbox(label="Language (Auto/English/Chinese/...)", value="Auto")
+                design_instruct = gr.Textbox(label="Instruction", lines=3, placeholder="例如: 温柔、低沉、广播腔")
+                with gr.Row():
+                    design_max_tokens = gr.Number(label="max_new_tokens", value=1024, precision=0)
+                    design_temp = gr.Number(label="temperature", value=0.8)
+                    design_top_k = gr.Number(label="top_k", value=50, precision=0)
+                    design_top_p = gr.Number(label="top_p", value=0.9)
+                    design_rep_pen = gr.Number(label="repetition_penalty", value=1.05)
+                design_gen_btn = gr.Button("Generate")
+                design_audio_out = gr.Audio(label="Output", type="numpy")
+                design_status = gr.Textbox(label="Status")
+
+        gr.Markdown(
+            "Disclaimer: Generated audio is for demo use only. Do not use for illegal or harmful purposes."
+        )
+
+        # ===== 加载模型逻辑 =====
+        def load_model_fn(repo_id: str, local_path: str):
+            nonlocal state
+            try:
+                # 确定模型路径
+                if local_path.strip():
+                    checkpoint = local_path.strip()
+                else:
+                    # 先检查当前目录下载的模型
+                    local_dir = _get_default_download_dir(repo_id)
+                    if local_dir.exists():
+                        has_config, has_weights = _validate_model_dir(local_dir)
+                        if has_config and has_weights:
+                            checkpoint = str(local_dir)
+                        else:
+                            checkpoint = repo_id
+                    else:
+                        checkpoint = repo_id
+
+                # 加载模型
+                args.checkpoint = checkpoint
+                tts = _load_tts(args)
+                model_type = getattr(tts.model, "tts_model_type", "")
+
+                state["tts"] = tts
+                state["checkpoint"] = checkpoint
+                state["model_type"] = model_type
+
+                # 获取 speakers (仅 custom_voice 模式)
+                speakers = []
+                if model_type == "custom_voice":
+                    speakers = tts.model.get_supported_speakers() or []
+
+                status_msg = f"模型加载成功!\n路径: {checkpoint}\n类型: {model_type}"
+                sys_check = _system_check_summary(checkpoint, output_dir)
+
+                # 返回 UI 更新
+                return (
+                    status_msg,  # model_status_text
+                    gr.update(visible=True),  # tts_area
+                    sys_check,  # sys_info
+                    gr.update(visible=(model_type == "base")),  # base_tab
+                    gr.update(visible=(model_type == "custom_voice")),  # custom_tab
+                    gr.update(visible=(model_type == "voice_design")),  # design_tab
+                    gr.update(choices=speakers, value=speakers[0] if speakers else None),  # custom_speaker
+                )
+            except Exception as e:
+                error_msg = f"模型加载失败: {str(e)}"
+                return (
+                    error_msg,
+                    gr.update(visible=False),
+                    "",
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.update(choices=[], value=None),
+                )
+
+        load_btn.click(
+            load_model_fn,
+            inputs=[model_dropdown, local_path_input],
+            outputs=[model_status_text, tts_area, sys_info, base_tab, custom_tab, design_tab, custom_speaker]
+        )
+
+        # 刷新系统检查
+        def refresh_sys_check():
+            if state["checkpoint"]:
+                return _system_check_summary(state["checkpoint"], output_dir)
+            return "模型未加载"
+
+        refresh_btn.click(refresh_sys_check, outputs=[sys_info])
+
+        # ===== TTS 生成函数 =====
+        def infer_base(text_in, lang_in, ref_audio_path, ref_text_in, xvec_only_in,
+                       max_new_tokens_in, temperature_in, top_k_in, top_p_in, repetition_penalty_in):
+            if state["tts"] is None:
+                return None, "请先加载模型"
+            if not ref_audio_path:
+                return None, "请先上传参考音频"
+            if not xvec_only_in and not (ref_text_in or "").strip():
+                return None, "ICL 模式需要参考文本"
+
+            gen_kwargs = _collect_gen_kwargs(
+                _coerce_int(max_new_tokens_in, 1024),
+                _coerce_float(temperature_in, 0.8),
+                _coerce_int(top_k_in, 50),
+                _coerce_float(top_p_in, 0.9),
+                _coerce_float(repetition_penalty_in, 1.05),
+            )
+            wavs, sr = state["tts"].generate_voice_clone(
+                text=text_in,
+                language=_maybe_auto_language(lang_in),
+                ref_audio=ref_audio_path,
+                ref_text=ref_text_in,
+                x_vector_only_mode=bool(xvec_only_in),
+                **gen_kwargs,
+            )
+            saved_path = ""
+            if save_audio:
+                saved_path = _save_wav(wavs[0], sr, output_dir, "base")
+            status_msg = f"OK{f' | Saved: {saved_path}' if saved_path else ''}"
+            return (sr, wavs[0]), status_msg
+
+        base_gen_btn.click(
+            infer_base,
+            inputs=[base_text, base_language, base_ref_audio, base_ref_text, base_xvec_only,
+                    base_max_tokens, base_temp, base_top_k, base_top_p, base_rep_pen],
+            outputs=[base_audio_out, base_status]
+        )
+
+        def infer_custom(text_in, lang_in, speaker_in, instruct_in,
+                         max_new_tokens_in, temperature_in, top_k_in, top_p_in, repetition_penalty_in):
+            if state["tts"] is None:
+                return None, "请先加载模型"
+            if not speaker_in:
+                return None, "请选择 speaker"
+
+            gen_kwargs = _collect_gen_kwargs(
+                _coerce_int(max_new_tokens_in, 1024),
+                _coerce_float(temperature_in, 0.8),
+                _coerce_int(top_k_in, 50),
+                _coerce_float(top_p_in, 0.9),
+                _coerce_float(repetition_penalty_in, 1.05),
+            )
+            wavs, sr = state["tts"].generate_custom_voice(
+                text=text_in,
+                language=_maybe_auto_language(lang_in),
+                speaker=speaker_in,
+                instruct=instruct_in,
+                **gen_kwargs,
+            )
+            saved_path = ""
+            if save_audio:
+                saved_path = _save_wav(wavs[0], sr, output_dir, "custom")
+            status_msg = f"OK{f' | Saved: {saved_path}' if saved_path else ''}"
+            return (sr, wavs[0]), status_msg
+
+        custom_gen_btn.click(
+            infer_custom,
+            inputs=[custom_text, custom_language, custom_speaker, custom_instruct,
+                    custom_max_tokens, custom_temp, custom_top_k, custom_top_p, custom_rep_pen],
+            outputs=[custom_audio_out, custom_status]
+        )
+
+        def infer_design(text_in, lang_in, instruct_in,
+                         max_new_tokens_in, temperature_in, top_k_in, top_p_in, repetition_penalty_in):
+            if state["tts"] is None:
+                return None, "请先加载模型"
+
+            gen_kwargs = _collect_gen_kwargs(
+                _coerce_int(max_new_tokens_in, 1024),
+                _coerce_float(temperature_in, 0.8),
+                _coerce_int(top_k_in, 50),
+                _coerce_float(top_p_in, 0.9),
+                _coerce_float(repetition_penalty_in, 1.05),
+            )
+            wavs, sr = state["tts"].generate_voice_design(
+                text=text_in,
+                language=_maybe_auto_language(lang_in),
+                instruct=instruct_in,
+                **gen_kwargs,
+            )
+            saved_path = ""
+            if save_audio:
+                saved_path = _save_wav(wavs[0], sr, output_dir, "design")
+            status_msg = f"OK{f' | Saved: {saved_path}' if saved_path else ''}"
+            return (sr, wavs[0]), status_msg
+
+        design_gen_btn.click(
+            infer_design,
+            inputs=[design_text, design_language, design_instruct,
+                    design_max_tokens, design_temp, design_top_k, design_top_p, design_rep_pen],
+            outputs=[design_audio_out, design_status]
+        )
+
+    return demo
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -850,42 +1156,48 @@ def main(argv=None) -> int:
     if args.ssl_keyfile:
         launch_kwargs["ssl_keyfile"] = args.ssl_keyfile
 
-    checkpoint = args.checkpoint
+    # 注释掉自动扫描和加载模型的逻辑
+    # 现在直接启动 UI，让用户在界面中选择下载和加载模型
+    # checkpoint = args.checkpoint
+    #
+    # # 如果没有指定 checkpoint，尝试自动检测
+    # if checkpoint is None or args.auto_detect:
+    #     print("正在扫描本地模型缓存...")
+    #     auto_path = _auto_detect_model()
+    #     if auto_path:
+    #         print(f"检测到已缓存的模型: {auto_path}")
+    #         if checkpoint is None:
+    #             checkpoint = auto_path
+    #     else:
+    #         print("未检测到本地模型，将显示下载界面。")
+    #
+    # # 如果仍然没有 checkpoint，显示下载界面
+    # if checkpoint is None:
+    #     print("启动模型下载界面...")
+    #     demo = build_download_ui()
+    #     demo.queue(default_concurrency_limit=int(args.concurrency)).launch(**launch_kwargs)
+    #     return 0
+    #
+    # # 检查指定的 checkpoint 是否有效
+    # model_status = _check_model_downloaded(checkpoint)
+    # if model_status["status"] in {"local_file", "local_dir_invalid", "cached_invalid", "local_missing"}:
+    #     print(f"错误: 指定的模型路径无效: {checkpoint}")
+    #     if model_status.get("error"):
+    #         print(f"原因: {model_status['error']}")
+    #     print("请提供模型目录或 HuggingFace repo id。")
+    #     return 1
+    # if model_status["status"] == "not_cached":
+    #     print(f"警告: 指定的模型 '{checkpoint}' 未在本地找到。")
+    #     print("尝试从 HuggingFace 下载模型...")
+    #
+    # output_dir = _ensure_output_dir(args.output_dir)
+    # args.checkpoint = checkpoint  # 更新 args 以便 _load_tts 使用
+    # tts = _load_tts(args)
+    # demo = build_demo(tts, checkpoint, output_dir, save_audio=not args.no_save)
 
-    # 如果没有指定 checkpoint，尝试自动检测
-    if checkpoint is None or args.auto_detect:
-        print("正在扫描本地模型缓存...")
-        auto_path = _auto_detect_model()
-        if auto_path:
-            print(f"检测到已缓存的模型: {auto_path}")
-            if checkpoint is None:
-                checkpoint = auto_path
-        else:
-            print("未检测到本地模型，将显示下载界面。")
-
-    # 如果仍然没有 checkpoint，显示下载界面
-    if checkpoint is None:
-        print("启动模型下载界面...")
-        demo = build_download_ui()
-        demo.queue(default_concurrency_limit=int(args.concurrency)).launch(**launch_kwargs)
-        return 0
-
-    # 检查指定的 checkpoint 是否有效
-    model_status = _check_model_downloaded(checkpoint)
-    if model_status["status"] in {"local_file", "local_dir_invalid", "cached_invalid", "local_missing"}:
-        print(f"错误: 指定的模型路径无效: {checkpoint}")
-        if model_status.get("error"):
-            print(f"原因: {model_status['error']}")
-        print("请提供模型目录或 HuggingFace repo id。")
-        return 1
-    if model_status["status"] == "not_cached":
-        print(f"警告: 指定的模型 '{checkpoint}' 未在本地找到。")
-        print("尝试从 HuggingFace 下载模型...")
-
-    output_dir = _ensure_output_dir(args.output_dir)
-    args.checkpoint = checkpoint  # 更新 args 以便 _load_tts 使用
-    tts = _load_tts(args)
-    demo = build_demo(tts, checkpoint, output_dir, save_audio=not args.no_save)
+    print("启动 Qwen3-TTS Gradio 界面...")
+    print("模型将在界面中选择后加载。")
+    demo = build_lazy_demo(args)
 
     demo.queue(default_concurrency_limit=int(args.concurrency)).launch(**launch_kwargs)
     return 0
