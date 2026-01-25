@@ -398,32 +398,47 @@ def _collect_gen_kwargs(max_new_tokens, temperature, top_k, top_p, repetition_pe
 def _load_tts(args: argparse.Namespace) -> Qwen3TTSModel:
     dtype = _dtype_from_str(args.dtype)
     attn_impl = None if args.no_flash_attn else "flash_attention_2"
+
+    # 在加载前清理 GPU 缓存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+
     return Qwen3TTSModel.from_pretrained(
         args.checkpoint,
         device_map=args.device,
-        dtype=dtype,
+        torch_dtype=dtype,
         attn_implementation=attn_impl,
+        low_cpu_mem_usage=True,  # 减少加载时的内存峰值
     )
 
 
 def _build_base_ui(tts: Qwen3TTSModel, output_dir: str, save_audio: bool):
-    with gr.Tab("Base (Voice Clone)"):
-        text = gr.Textbox(label="Text", lines=4, placeholder="请输入要合成的文本")
-        language = gr.Textbox(label="Language (Auto/English/Chinese/...)", value="Auto")
-        ref_audio = gr.Audio(label="Reference Audio (wav)", type="filepath")
-        ref_text = gr.Textbox(label="Reference Text (required if not x-vector only)", lines=3)
-        xvec_only = gr.Checkbox(label="X-vector only (no ref text)", value=False)
-
+    with gr.Tab("语音克隆 (Base)"):
         with gr.Row():
-            max_new_tokens = gr.Number(label="max_new_tokens", value=1024, precision=0)
-            temperature = gr.Number(label="temperature", value=0.8)
-            top_k = gr.Number(label="top_k", value=50, precision=0)
-            top_p = gr.Number(label="top_p", value=0.9)
-            repetition_penalty = gr.Number(label="repetition_penalty", value=1.05)
+            with gr.Column(scale=3):
+                text = gr.Textbox(label="合成文本", lines=4, placeholder="请输入要合成的文本...", info="支持中英文混合")
+                with gr.Row():
+                    language = gr.Dropdown(label="语言", choices=["Auto", "Chinese", "English"], value="Auto", allow_custom_value=True, scale=1)
+                    xvec_only = gr.Checkbox(label="仅使用音色特征 (无需参考文本)", value=False, scale=2)
+            with gr.Column(scale=2):
+                ref_audio = gr.Audio(label="参考音频", type="filepath", sources=["upload", "microphone"])
+                ref_text = gr.Textbox(label="参考音频文本", lines=2, placeholder="输入参考音频中说的内容...", info="关闭「仅音色」时必填")
 
-        gen_btn = gr.Button("Generate")
-        audio_out = gr.Audio(label="Output", type="numpy")
-        status = gr.Textbox(label="Status")
+        with gr.Accordion("生成参数", open=False):
+            with gr.Row():
+                max_new_tokens = gr.Slider(label="max_new_tokens", minimum=256, maximum=4096, value=1024, step=64)
+                temperature = gr.Slider(label="temperature", minimum=0.1, maximum=2.0, value=0.8, step=0.05)
+            with gr.Row():
+                top_k = gr.Slider(label="top_k", minimum=1, maximum=100, value=50, step=1)
+                top_p = gr.Slider(label="top_p", minimum=0.1, maximum=1.0, value=0.9, step=0.05)
+                repetition_penalty = gr.Slider(label="repetition_penalty", minimum=1.0, maximum=2.0, value=1.05, step=0.01)
+
+        gen_btn = gr.Button("生成语音", variant="primary")
+        with gr.Row():
+            audio_out = gr.Audio(label="生成结果", type="numpy", scale=3)
+            status = gr.Textbox(label="状态", lines=2, scale=1)
 
         def _infer_base(
             text_in: str,
@@ -483,22 +498,28 @@ def _build_base_ui(tts: Qwen3TTSModel, output_dir: str, save_audio: bool):
 
 def _build_custom_ui(tts: Qwen3TTSModel, output_dir: str, save_audio: bool):
     speakers = tts.model.get_supported_speakers() or []
-    with gr.Tab("CustomVoice"):
-        text = gr.Textbox(label="Text", lines=4, placeholder="请输入要合成的文本")
-        language = gr.Textbox(label="Language (Auto/English/Chinese/...)", value="Auto")
-        speaker = gr.Dropdown(label="Speaker", choices=speakers, value=speakers[0] if speakers else None)
-        instruct = gr.Textbox(label="Instruction (optional)", lines=3)
-
+    with gr.Tab("预设角色 (CustomVoice)"):
         with gr.Row():
-            max_new_tokens = gr.Number(label="max_new_tokens", value=1024, precision=0)
-            temperature = gr.Number(label="temperature", value=0.8)
-            top_k = gr.Number(label="top_k", value=50, precision=0)
-            top_p = gr.Number(label="top_p", value=0.9)
-            repetition_penalty = gr.Number(label="repetition_penalty", value=1.05)
+            with gr.Column(scale=2):
+                text = gr.Textbox(label="合成文本", lines=4, placeholder="请输入要合成的文本...", info="支持中英文混合")
+                language = gr.Dropdown(label="语言", choices=["Auto", "Chinese", "English"], value="Auto", allow_custom_value=True)
+            with gr.Column(scale=1):
+                speaker = gr.Dropdown(label="选择角色", choices=speakers, value=speakers[0] if speakers else None, info="模型内置的预设说话人")
+                instruct = gr.Textbox(label="风格指令 (可选)", lines=2, placeholder="例如: 开心地、悄悄地、快速...")
 
-        gen_btn = gr.Button("Generate")
-        audio_out = gr.Audio(label="Output", type="numpy")
-        status = gr.Textbox(label="Status")
+        with gr.Accordion("生成参数", open=False):
+            with gr.Row():
+                max_new_tokens = gr.Slider(label="max_new_tokens", minimum=256, maximum=4096, value=1024, step=64)
+                temperature = gr.Slider(label="temperature", minimum=0.1, maximum=2.0, value=0.8, step=0.05)
+            with gr.Row():
+                top_k = gr.Slider(label="top_k", minimum=1, maximum=100, value=50, step=1)
+                top_p = gr.Slider(label="top_p", minimum=0.1, maximum=1.0, value=0.9, step=0.05)
+                repetition_penalty = gr.Slider(label="repetition_penalty", minimum=1.0, maximum=2.0, value=1.05, step=0.01)
+
+        gen_btn = gr.Button("生成语音", variant="primary")
+        with gr.Row():
+            audio_out = gr.Audio(label="生成结果", type="numpy", scale=3)
+            status = gr.Textbox(label="状态", lines=2, scale=1)
 
         def _infer_custom(
             text_in: str,
@@ -552,21 +573,27 @@ def _build_custom_ui(tts: Qwen3TTSModel, output_dir: str, save_audio: bool):
 
 
 def _build_voice_design_ui(tts: Qwen3TTSModel, output_dir: str, save_audio: bool):
-    with gr.Tab("VoiceDesign"):
-        text = gr.Textbox(label="Text", lines=4, placeholder="请输入要合成的文本")
-        language = gr.Textbox(label="Language (Auto/English/Chinese/...)", value="Auto")
-        instruct = gr.Textbox(label="Instruction", lines=3, placeholder="例如: 温柔、低沉、广播腔")
-
+    with gr.Tab("风格设计 (VoiceDesign)"):
         with gr.Row():
-            max_new_tokens = gr.Number(label="max_new_tokens", value=1024, precision=0)
-            temperature = gr.Number(label="temperature", value=0.8)
-            top_k = gr.Number(label="top_k", value=50, precision=0)
-            top_p = gr.Number(label="top_p", value=0.9)
-            repetition_penalty = gr.Number(label="repetition_penalty", value=1.05)
+            with gr.Column(scale=2):
+                text = gr.Textbox(label="合成文本", lines=4, placeholder="请输入要合成的文本...", info="支持中英文混合")
+                language = gr.Dropdown(label="语言", choices=["Auto", "Chinese", "English"], value="Auto", allow_custom_value=True)
+            with gr.Column(scale=1):
+                instruct = gr.Textbox(label="语音风格描述", lines=4, placeholder="描述你想要的声音特点...\n例如:\n- 温柔的女声，语速缓慢\n- 低沉有磁性的男声", info="用自然语言描述声音特点")
 
-        gen_btn = gr.Button("Generate")
-        audio_out = gr.Audio(label="Output", type="numpy")
-        status = gr.Textbox(label="Status")
+        with gr.Accordion("生成参数", open=False):
+            with gr.Row():
+                max_new_tokens = gr.Slider(label="max_new_tokens", minimum=256, maximum=4096, value=1024, step=64)
+                temperature = gr.Slider(label="temperature", minimum=0.1, maximum=2.0, value=0.8, step=0.05)
+            with gr.Row():
+                top_k = gr.Slider(label="top_k", minimum=1, maximum=100, value=50, step=1)
+                top_p = gr.Slider(label="top_p", minimum=0.1, maximum=1.0, value=0.9, step=0.05)
+                repetition_penalty = gr.Slider(label="repetition_penalty", minimum=1.0, maximum=2.0, value=1.05, step=0.01)
+
+        gen_btn = gr.Button("生成语音", variant="primary")
+        with gr.Row():
+            audio_out = gr.Audio(label="生成结果", type="numpy", scale=3)
+            status = gr.Textbox(label="状态", lines=2, scale=1)
 
         def _infer_design(
             text_in: str,
@@ -672,9 +699,14 @@ def _download_model(repo_id: str, local_dir: Optional[str], progress=gr.Progress
 
 def build_download_ui() -> gr.Blocks:
     """构建模型下载界面"""
-    with gr.Blocks(css=".gradio-container {max-width: 100% !important;}") as demo:
-        gr.Markdown("# Qwen3-TTS 模型下载器")
-        gr.Markdown("检测到本地没有可用的模型，请先下载模型。")
+    custom_css = """
+    .gradio-container {max-width: 100% !important;}
+    .main-title {text-align: center; margin-bottom: 0.5em;}
+    .sub-title {text-align: center; color: #666; font-size: 0.95em; margin-top: 0;}
+    """
+    with gr.Blocks(css=custom_css, title="Qwen3-TTS 下载") as demo:
+        gr.Markdown("# Qwen3-TTS 模型下载", elem_classes=["main-title"])
+        gr.Markdown("检测到本地没有可用的模型，请先下载模型", elem_classes=["sub-title"])
 
         # 显示已缓存的模型
         cached_models = _scan_all_cached_models()
@@ -688,25 +720,23 @@ def build_download_ui() -> gr.Blocks:
 
         # 下载新模型
         with gr.Accordion("下载新模型", open=not cached_models):
-            gr.Markdown("### 选择要下载的模型")
+            with gr.Group():
+                model_choice = gr.Dropdown(
+                    label="选择模型",
+                    choices=SUPPORTED_MODELS,
+                    value=SUPPORTED_MODELS[0],
+                    info="12Hz 更快，25Hz 质量更高 | Base=语音克隆, CustomVoice=预设角色, VoiceDesign=风格描述"
+                )
 
-            model_choice = gr.Dropdown(
-                label="模型",
-                choices=SUPPORTED_MODELS,
-                value=SUPPORTED_MODELS[0],
-                info="选择要下载的 Qwen3-TTS 模型"
-            )
+                default_root = _get_default_download_root()
+                gr.Markdown(f"📁 **下载目录**: `{default_root}`")
 
-            default_root = _get_default_download_root()
-            gr.Markdown(f"**默认下载目录**: `{default_root}`")
-            gr.Markdown("将自动在当前目录下为每个模型创建子目录。")
-
-            use_custom_dir = gr.Checkbox(label="使用自定义下载目录", value=False)
-            custom_dir = gr.Textbox(
-                label="自定义目录 (留空使用默认缓存)",
-                placeholder=f"例如: ~/models/Qwen3-TTS-0.6B",
-                visible=False
-            )
+                use_custom_dir = gr.Checkbox(label="使用自定义下载目录", value=False)
+                custom_dir = gr.Textbox(
+                    label="自定义目录",
+                    placeholder=f"例如: ~/models/Qwen3-TTS-0.6B",
+                    visible=False
+                )
 
             def toggle_custom_dir(use_custom):
                 return gr.update(visible=use_custom)
@@ -714,7 +744,7 @@ def build_download_ui() -> gr.Blocks:
             use_custom_dir.change(toggle_custom_dir, inputs=[use_custom_dir], outputs=[custom_dir])
 
             download_btn = gr.Button("开始下载", variant="primary")
-            download_status = gr.Textbox(label="下载状态", lines=6, interactive=False)
+            download_status = gr.Textbox(label="下载状态", lines=5, interactive=False, show_copy_button=True)
 
             def do_download(model, use_custom, custom_path, progress=gr.Progress()):
                 local_dir = custom_path if use_custom and custom_path.strip() else None
@@ -728,53 +758,53 @@ def build_download_ui() -> gr.Blocks:
 
         # 手动指定模型路径
         with gr.Accordion("手动指定本地模型路径", open=False):
-            gr.Markdown("如果模型已经下载到其他位置，可以直接指定路径启动:")
-            manual_path = gr.Textbox(
-                label="模型路径",
-                placeholder="例如: /path/to/Qwen3-TTS-12Hz-0.6B-Base"
-            )
-            check_btn = gr.Button("检查路径")
-            check_result = gr.Textbox(label="检查结果", lines=4, interactive=False)
+            gr.Markdown("如果模型已经下载到其他位置，可以直接指定路径:")
+            with gr.Row():
+                manual_path = gr.Textbox(
+                    label="模型路径",
+                    placeholder="例如: /path/to/Qwen3-TTS-12Hz-0.6B-Base",
+                    scale=3
+                )
+                check_btn = gr.Button("检查", scale=1)
+            check_result = gr.Textbox(label="检查结果", lines=3, interactive=False, show_copy_button=True)
 
             def check_manual_path(path):
                 if not path or not path.strip():
                     return "请输入路径"
                 result = _check_model_downloaded(path.strip())
                 if result["status"] in ("local_dir", "cached"):
-                    return f"检测到有效模型!\n路径: {result.get('path', path)}\n\n启动命令:\npython jetson_gradio_app.py {result.get('path', path)}"
-                return f"未检测到有效模型\n状态: {result['status']}\n错误: {result.get('error', '路径不存在或缺少必要文件')}"
+                    return f"✅ 检测到有效模型!\n路径: {result.get('path', path)}\n\n启动命令:\npython jetson_gradio_app.py {result.get('path', path)}"
+                return f"❌ 未检测到有效模型\n状态: {result['status']}\n错误: {result.get('error', '路径不存在或缺少必要文件')}"
 
             check_btn.click(check_manual_path, inputs=[manual_path], outputs=[check_result])
 
         gr.Markdown("---")
-        gr.Markdown("### 使用说明")
-        gr.Markdown("""
-1. 选择要下载的模型类型:
-   - **Base**: 语音克隆模型，需要参考音频
-   - **CustomVoice**: 预定义说话人模型
-   - **VoiceDesign**: 通过文字描述控制语音风格
+        with gr.Accordion("使用说明", open=False):
+            gr.Markdown("""
+**模型类型说明:**
+- **Base**: 语音克隆模型，需要参考音频
+- **CustomVoice**: 预定义说话人模型
+- **VoiceDesign**: 通过文字描述控制语音风格
 
-2. **12Hz vs 25Hz**: 12Hz 模型更快，25Hz 模型质量更高
+**采样率说明:**
+- **12Hz**: 更快的生成速度
+- **25Hz**: 更高的音频质量
 
-3. 下载完成后，使用显示的命令重启应用
-        """)
+下载完成后，使用显示的命令重启应用。
+            """)
 
     return demo
 
 
 def build_demo(tts: Qwen3TTSModel, checkpoint: str, output_dir: str, save_audio: bool) -> gr.Blocks:
-    with gr.Blocks(css=".gradio-container {max-width: 100% !important;}") as demo:
-        gr.Markdown("# Qwen3-TTS Jetson Orin Gradio Demo")
-        gr.Markdown("模型类型会根据 checkpoint 自动选择对应的界面。")
-
-        with gr.Accordion("System Checks", open=True):
-            sys_info = gr.Textbox(label="状态", lines=8, value=_system_check_summary(checkpoint, output_dir))
-            refresh_btn = gr.Button("刷新检查")
-
-            def _refresh() -> str:
-                return _system_check_summary(checkpoint, output_dir)
-
-            refresh_btn.click(_refresh, outputs=[sys_info])
+    custom_css = """
+    .gradio-container {max-width: 100% !important;}
+    .main-title {text-align: center; margin-bottom: 0.5em;}
+    .sub-title {text-align: center; color: #666; font-size: 0.95em; margin-top: 0;}
+    """
+    with gr.Blocks(css=custom_css, title="Qwen3-TTS") as demo:
+        gr.Markdown("# Qwen3-TTS Jetson Orin", elem_classes=["main-title"])
+        gr.Markdown("文本转语音演示 | Text-to-Speech Demo", elem_classes=["sub-title"])
 
         model_type = getattr(tts.model, "tts_model_type", "")
         if model_type == "base":
@@ -784,10 +814,22 @@ def build_demo(tts: Qwen3TTSModel, checkpoint: str, output_dir: str, save_audio:
         elif model_type == "voice_design":
             _build_voice_design_ui(tts, output_dir, save_audio)
         else:
-            gr.Markdown(f"Unsupported model type: {model_type}")
+            gr.Markdown(f"⚠️ 不支持的模型类型: {model_type}")
 
+        with gr.Accordion("系统状态", open=False):
+            sys_info = gr.Textbox(label="详细信息", lines=6, value=_system_check_summary(checkpoint, output_dir), show_copy_button=True)
+            refresh_btn = gr.Button("刷新", size="sm")
+
+            def _refresh() -> str:
+                return _system_check_summary(checkpoint, output_dir)
+
+            refresh_btn.click(_refresh, outputs=[sys_info])
+
+        gr.Markdown("---")
         gr.Markdown(
-            "Disclaimer: Generated audio is for demo use only. Do not use for illegal or harmful purposes."
+            "<center style='color: #888; font-size: 0.85em;'>"
+            "⚠️ 生成的音频仅供演示使用，请勿用于非法或有害用途。"
+            "</center>"
         )
     return demo
 
@@ -800,7 +842,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Model checkpoint path or HuggingFace repo id. If not provided, will auto-detect or show download UI.",
     )
-    parser.add_argument("--device", default="cuda:0", help="Device for device_map (default: cuda:0).")
+    parser.add_argument("--device", default="cpu", help="Device for device_map (default: cpu).")
     parser.add_argument(
         "--dtype",
         default="float16",
@@ -809,8 +851,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--no-flash-attn",
+        dest="no_flash_attn",
         action="store_true",
-        help="Disable FlashAttention-2 (recommended on Jetson).",
+        default=True,
+        help="Disable FlashAttention-2 (default: disabled).",
+    )
+    parser.add_argument(
+        "--flash-attn",
+        dest="no_flash_attn",
+        action="store_false",
+        help="Enable FlashAttention-2.",
     )
     parser.add_argument("--ip", default="0.0.0.0", help="Gradio server bind IP.")
     parser.add_argument("--port", type=int, default=8000, help="Gradio server port.")
@@ -865,37 +915,71 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
         model_list = "\n".join([f"  - {m['repo_id']}: {m['path']}" for m in local_models])
         initial_status = f"检测到本地已下载的模型:\n{model_list}\n\n可以直接点击「加载模型」"
 
-    with gr.Blocks(css=".gradio-container {max-width: 100% !important;}") as demo:
-        gr.Markdown("# Qwen3-TTS Jetson Orin Gradio Demo")
-        gr.Markdown("请先下载或选择模型，然后点击「加载模型」按钮。")
+    # 自定义 CSS 样式
+    custom_css = """
+    .gradio-container {max-width: 100% !important;}
+    .main-title {text-align: center; margin-bottom: 0.5em;}
+    .sub-title {text-align: center; color: #666; font-size: 0.95em; margin-top: 0;}
+    .status-box {background: #f8f9fa; border-radius: 8px; padding: 12px; border: 1px solid #e9ecef;}
+    .gen-btn {min-height: 45px !important;}
+    .param-group {background: #fafafa; border-radius: 6px; padding: 10px; margin-top: 8px;}
+    """
+
+    with gr.Blocks(css=custom_css, title="Qwen3-TTS") as demo:
+        gr.Markdown("# Qwen3-TTS Jetson Orin", elem_classes=["main-title"])
+        gr.Markdown("文本转语音演示 | Text-to-Speech Demo", elem_classes=["sub-title"])
 
         # ===== 模型管理区域 =====
         with gr.Accordion("模型管理", open=True):
-            # 模型选择
-            with gr.Row():
+            with gr.Group():
+                # 模型选择 - 第一行
                 model_dropdown = gr.Dropdown(
                     label="选择模型",
                     choices=SUPPORTED_MODELS,
                     value=default_model,
-                    info="选择要下载/加载的模型"
+                    info="12Hz 更快，25Hz 质量更高 | Base=语音克隆, CustomVoice=预设角色, VoiceDesign=风格描述"
                 )
+                # 本地路径 - 第二行
                 local_path_input = gr.Textbox(
-                    label="或输入本地路径",
-                    placeholder="留空使用上方选择的模型",
+                    label="本地模型路径 (可选)",
+                    placeholder="留空则使用上方选择的模型，或输入已下载模型的完整路径",
                     value=default_path,
-                    scale=2
                 )
 
-            # 下载按钮和状态
-            with gr.Row():
-                download_btn = gr.Button("下载模型", variant="secondary")
-                load_btn = gr.Button("加载模型", variant="primary")
+            # 高级加载选项 - 折叠
+            with gr.Accordion("加载选项", open=False):
+                with gr.Row():
+                    device_input = gr.Dropdown(
+                        label="Device",
+                        choices=["cpu", "cuda", "cuda:0", "auto"],
+                        value=args.device,
+                        allow_custom_value=True,
+                        info="运行设备"
+                    )
+                    dtype_dropdown = gr.Dropdown(
+                        label="精度 (DType)",
+                        choices=["float16", "bfloat16", "float32"],
+                        value="float16" if args.dtype in ["fp16", "float16"] else args.dtype,
+                        info="float16 推荐用于 Jetson"
+                    )
+                    flash_attn_checkbox = gr.Checkbox(
+                        label="FlashAttention-2",
+                        value=not args.no_flash_attn,
+                        info="需要安装 flash-attn"
+                    )
 
+            # 操作按钮
+            with gr.Row():
+                download_btn = gr.Button("下载模型", variant="secondary", scale=1)
+                load_btn = gr.Button("加载模型", variant="primary", scale=2, elem_classes=["gen-btn"])
+
+            # 状态显示
             model_status_text = gr.Textbox(
-                label="模型状态",
-                lines=4,
+                label="状态",
+                lines=3,
                 interactive=False,
-                value=initial_status
+                value=initial_status,
+                show_copy_button=True
             )
 
             # 检查本地是否已有模型
@@ -931,66 +1015,163 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
         # ===== TTS 生成区域 (初始隐藏) =====
         with gr.Column(visible=False) as tts_area:
-            with gr.Accordion("System Checks", open=False):
-                sys_info = gr.Textbox(label="状态", lines=8, value="")
-                refresh_btn = gr.Button("刷新检查")
+            gr.Markdown("---")
 
             # Base 模式 UI
-            with gr.Tab("Base (Voice Clone)", visible=False) as base_tab:
-                base_text = gr.Textbox(label="Text", lines=4, placeholder="请输入要合成的文本")
-                base_language = gr.Textbox(label="Language (Auto/English/Chinese/...)", value="Auto")
-                base_ref_audio = gr.Audio(label="Reference Audio (wav)", type="filepath")
-                base_ref_text = gr.Textbox(label="Reference Text (required if not x-vector only)", lines=3)
-                base_xvec_only = gr.Checkbox(label="X-vector only (no ref text)", value=False)
+            with gr.Tab("语音克隆 (Base)", visible=False) as base_tab:
                 with gr.Row():
-                    base_max_tokens = gr.Number(label="max_new_tokens", value=1024, precision=0)
-                    base_temp = gr.Number(label="temperature", value=0.8)
-                    base_top_k = gr.Number(label="top_k", value=50, precision=0)
-                    base_top_p = gr.Number(label="top_p", value=0.9)
-                    base_rep_pen = gr.Number(label="repetition_penalty", value=1.05)
-                base_gen_btn = gr.Button("Generate")
-                base_audio_out = gr.Audio(label="Output", type="numpy")
-                base_status = gr.Textbox(label="Status")
+                    with gr.Column(scale=3):
+                        base_text = gr.Textbox(
+                            label="合成文本",
+                            lines=4,
+                            placeholder="请输入要合成的文本...",
+                            info="支持中英文混合"
+                        )
+                        with gr.Row():
+                            base_language = gr.Dropdown(
+                                label="语言",
+                                choices=["Auto", "Chinese", "English"],
+                                value="Auto",
+                                allow_custom_value=True,
+                                scale=1
+                            )
+                            base_xvec_only = gr.Checkbox(
+                                label="仅使用音色特征 (无需参考文本)",
+                                value=False,
+                                scale=2
+                            )
+                    with gr.Column(scale=2):
+                        base_ref_audio = gr.Audio(
+                            label="参考音频",
+                            type="filepath",
+                            sources=["upload", "microphone"]
+                        )
+                        base_ref_text = gr.Textbox(
+                            label="参考音频文本",
+                            lines=2,
+                            placeholder="输入参考音频中说的内容...",
+                            info="关闭「仅音色」时必填"
+                        )
+
+                with gr.Accordion("生成参数", open=False):
+                    with gr.Row():
+                        base_max_tokens = gr.Slider(label="max_new_tokens", minimum=256, maximum=4096, value=1024, step=64)
+                        base_temp = gr.Slider(label="temperature", minimum=0.1, maximum=2.0, value=0.8, step=0.05)
+                    with gr.Row():
+                        base_top_k = gr.Slider(label="top_k", minimum=1, maximum=100, value=50, step=1)
+                        base_top_p = gr.Slider(label="top_p", minimum=0.1, maximum=1.0, value=0.9, step=0.05)
+                        base_rep_pen = gr.Slider(label="repetition_penalty", minimum=1.0, maximum=2.0, value=1.05, step=0.01)
+
+                base_gen_btn = gr.Button("生成语音", variant="primary", elem_classes=["gen-btn"])
+
+                with gr.Row():
+                    base_audio_out = gr.Audio(label="生成结果", type="numpy", scale=3)
+                    base_status = gr.Textbox(label="状态", lines=2, scale=1)
 
             # CustomVoice 模式 UI
-            with gr.Tab("CustomVoice", visible=False) as custom_tab:
-                custom_text = gr.Textbox(label="Text", lines=4, placeholder="请输入要合成的文本")
-                custom_language = gr.Textbox(label="Language (Auto/English/Chinese/...)", value="Auto")
-                custom_speaker = gr.Dropdown(label="Speaker", choices=[], value=None)
-                custom_instruct = gr.Textbox(label="Instruction (optional)", lines=3)
+            with gr.Tab("预设角色 (CustomVoice)", visible=False) as custom_tab:
                 with gr.Row():
-                    custom_max_tokens = gr.Number(label="max_new_tokens", value=1024, precision=0)
-                    custom_temp = gr.Number(label="temperature", value=0.8)
-                    custom_top_k = gr.Number(label="top_k", value=50, precision=0)
-                    custom_top_p = gr.Number(label="top_p", value=0.9)
-                    custom_rep_pen = gr.Number(label="repetition_penalty", value=1.05)
-                custom_gen_btn = gr.Button("Generate")
-                custom_audio_out = gr.Audio(label="Output", type="numpy")
-                custom_status = gr.Textbox(label="Status")
+                    with gr.Column(scale=2):
+                        custom_text = gr.Textbox(
+                            label="合成文本",
+                            lines=4,
+                            placeholder="请输入要合成的文本...",
+                            info="支持中英文混合"
+                        )
+                        custom_language = gr.Dropdown(
+                            label="语言",
+                            choices=["Auto", "Chinese", "English"],
+                            value="Auto",
+                            allow_custom_value=True
+                        )
+                    with gr.Column(scale=1):
+                        custom_speaker = gr.Dropdown(
+                            label="选择角色",
+                            choices=[],
+                            value=None,
+                            info="模型内置的预设说话人"
+                        )
+                        custom_instruct = gr.Textbox(
+                            label="风格指令 (可选)",
+                            lines=2,
+                            placeholder="例如: 开心地、悄悄地、快速..."
+                        )
+
+                with gr.Accordion("生成参数", open=False):
+                    with gr.Row():
+                        custom_max_tokens = gr.Slider(label="max_new_tokens", minimum=256, maximum=4096, value=1024, step=64)
+                        custom_temp = gr.Slider(label="temperature", minimum=0.1, maximum=2.0, value=0.8, step=0.05)
+                    with gr.Row():
+                        custom_top_k = gr.Slider(label="top_k", minimum=1, maximum=100, value=50, step=1)
+                        custom_top_p = gr.Slider(label="top_p", minimum=0.1, maximum=1.0, value=0.9, step=0.05)
+                        custom_rep_pen = gr.Slider(label="repetition_penalty", minimum=1.0, maximum=2.0, value=1.05, step=0.01)
+
+                custom_gen_btn = gr.Button("生成语音", variant="primary", elem_classes=["gen-btn"])
+
+                with gr.Row():
+                    custom_audio_out = gr.Audio(label="生成结果", type="numpy", scale=3)
+                    custom_status = gr.Textbox(label="状态", lines=2, scale=1)
 
             # VoiceDesign 模式 UI
-            with gr.Tab("VoiceDesign", visible=False) as design_tab:
-                design_text = gr.Textbox(label="Text", lines=4, placeholder="请输入要合成的文本")
-                design_language = gr.Textbox(label="Language (Auto/English/Chinese/...)", value="Auto")
-                design_instruct = gr.Textbox(label="Instruction", lines=3, placeholder="例如: 温柔、低沉、广播腔")
+            with gr.Tab("风格设计 (VoiceDesign)", visible=False) as design_tab:
                 with gr.Row():
-                    design_max_tokens = gr.Number(label="max_new_tokens", value=1024, precision=0)
-                    design_temp = gr.Number(label="temperature", value=0.8)
-                    design_top_k = gr.Number(label="top_k", value=50, precision=0)
-                    design_top_p = gr.Number(label="top_p", value=0.9)
-                    design_rep_pen = gr.Number(label="repetition_penalty", value=1.05)
-                design_gen_btn = gr.Button("Generate")
-                design_audio_out = gr.Audio(label="Output", type="numpy")
-                design_status = gr.Textbox(label="Status")
+                    with gr.Column(scale=2):
+                        design_text = gr.Textbox(
+                            label="合成文本",
+                            lines=4,
+                            placeholder="请输入要合成的文本...",
+                            info="支持中英文混合"
+                        )
+                        design_language = gr.Dropdown(
+                            label="语言",
+                            choices=["Auto", "Chinese", "English"],
+                            value="Auto",
+                            allow_custom_value=True
+                        )
+                    with gr.Column(scale=1):
+                        design_instruct = gr.Textbox(
+                            label="语音风格描述",
+                            lines=4,
+                            placeholder="描述你想要的声音特点...\n例如:\n- 温柔的女声，语速缓慢\n- 低沉有磁性的男声\n- 活泼的播音腔",
+                            info="用自然语言描述声音特点"
+                        )
 
+                with gr.Accordion("生成参数", open=False):
+                    with gr.Row():
+                        design_max_tokens = gr.Slider(label="max_new_tokens", minimum=256, maximum=4096, value=1024, step=64)
+                        design_temp = gr.Slider(label="temperature", minimum=0.1, maximum=2.0, value=0.8, step=0.05)
+                    with gr.Row():
+                        design_top_k = gr.Slider(label="top_k", minimum=1, maximum=100, value=50, step=1)
+                        design_top_p = gr.Slider(label="top_p", minimum=0.1, maximum=1.0, value=0.9, step=0.05)
+                        design_rep_pen = gr.Slider(label="repetition_penalty", minimum=1.0, maximum=2.0, value=1.05, step=0.01)
+
+                design_gen_btn = gr.Button("生成语音", variant="primary", elem_classes=["gen-btn"])
+
+                with gr.Row():
+                    design_audio_out = gr.Audio(label="生成结果", type="numpy", scale=3)
+                    design_status = gr.Textbox(label="状态", lines=2, scale=1)
+
+            # 系统状态放在最后
+            with gr.Accordion("系统状态", open=False):
+                sys_info = gr.Textbox(label="详细信息", lines=6, value="", show_copy_button=True)
+                refresh_btn = gr.Button("刷新", size="sm")
+
+        gr.Markdown("---")
         gr.Markdown(
-            "Disclaimer: Generated audio is for demo use only. Do not use for illegal or harmful purposes."
+            "<center style='color: #888; font-size: 0.85em;'>"
+            "⚠️ 生成的音频仅供演示使用，请勿用于非法或有害用途。"
+            "</center>"
         )
 
         # ===== 加载模型逻辑 =====
-        def load_model_fn(repo_id: str, local_path: str):
+        def load_model_fn(repo_id: str, local_path: str, device_in: str, dtype_in: str, flash_attn_in: bool):
             nonlocal state
             try:
+                # 应用当前 UI 中的加载参数
+                args.device = (device_in or "").strip() or args.device
+                args.dtype = (dtype_in or "").strip() or args.dtype
+                args.no_flash_attn = not bool(flash_attn_in)
+
                 # 确定模型路径
                 if local_path.strip():
                     checkpoint = local_path.strip()
@@ -1020,7 +1201,10 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 if model_type == "custom_voice":
                     speakers = tts.model.get_supported_speakers() or []
 
-                status_msg = f"模型加载成功!\n路径: {checkpoint}\n类型: {model_type}"
+                status_msg = (
+                    f"模型加载成功!\n路径: {checkpoint}\n类型: {model_type}\n"
+                    f"device={args.device} | dtype={args.dtype} | flash_attn={'on' if not args.no_flash_attn else 'off'}"
+                )
                 sys_check = _system_check_summary(checkpoint, output_dir)
 
                 # 返回 UI 更新
@@ -1047,7 +1231,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
         load_btn.click(
             load_model_fn,
-            inputs=[model_dropdown, local_path_input],
+            inputs=[model_dropdown, local_path_input, device_input, dtype_dropdown, flash_attn_checkbox],
             outputs=[model_status_text, tts_area, sys_info, base_tab, custom_tab, design_tab, custom_speaker]
         )
 
@@ -1165,6 +1349,20 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
     return demo
 
 
+def _get_local_ip() -> str:
+    """获取本机局域网 IP 地址"""
+    import socket
+    try:
+        # 创建一个 UDP socket 连接到外部地址（不实际发送数据）
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1221,6 +1419,17 @@ def main(argv=None) -> int:
     print("启动 Qwen3-TTS Gradio 界面...")
     print("模型将在界面中选择后加载。")
     demo = build_lazy_demo(args)
+
+    # 获取并显示访问地址
+    local_ip = _get_local_ip()
+    protocol = "https" if args.ssl_certfile else "http"
+    print("\n" + "=" * 50)
+    print("Gradio 服务启动中...")
+    print(f"本机访问: {protocol}://127.0.0.1:{args.port}")
+    print(f"局域网访问: {protocol}://{local_ip}:{args.port}")
+    if args.share:
+        print("公网链接将在下方显示...")
+    print("=" * 50 + "\n")
 
     demo.queue(default_concurrency_limit=int(args.concurrency)).launch(**launch_kwargs)
     return 0
