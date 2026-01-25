@@ -1000,6 +1000,102 @@ def _scan_local_models() -> List[Dict[str, Any]]:
     return found
 
 
+def _scan_models_in_directory(directory: str) -> List[Dict[str, Any]]:
+    """扫描指定目录下的所有有效模型"""
+    found = []
+    if not directory or not directory.strip():
+        return found
+
+    dir_path = Path(directory).expanduser().resolve()
+    if not dir_path.exists() or not dir_path.is_dir():
+        return found
+
+    try:
+        # 检查目录本身是否是模型目录
+        has_config, has_weights = _validate_model_dir(dir_path)
+        if has_config and has_weights:
+            found.append({
+                "name": dir_path.name,
+                "path": str(dir_path),
+                "type": _detect_model_type(dir_path),
+            })
+            return found
+
+        # 扫描子目录
+        for sub in sorted(dir_path.iterdir()):
+            if sub.is_dir():
+                has_config, has_weights = _validate_model_dir(sub)
+                if has_config and has_weights:
+                    found.append({
+                        "name": sub.name,
+                        "path": str(sub),
+                        "type": _detect_model_type(sub),
+                    })
+    except (PermissionError, OSError):
+        pass
+
+    return found
+
+
+def _detect_model_type(model_dir: Path) -> str:
+    """检测模型类型 (base/custom_voice/voice_design)"""
+    config_path = model_dir / "config.json"
+    if not config_path.exists():
+        return "unknown"
+
+    try:
+        import json
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        return config.get("tts_model_type", "unknown")
+    except Exception:
+        return "unknown"
+
+
+def _get_all_model_locations() -> List[str]:
+    """获取所有可能的模型位置"""
+    locations = []
+
+    # 1. 当前工作目录
+    cwd = str(Path.cwd().resolve())
+    locations.append(cwd)
+
+    # 2. 环境变量指定的目录
+    env_root = os.getenv("QWEN3_TTS_DOWNLOAD_DIR")
+    if env_root:
+        locations.append(str(Path(env_root).expanduser().resolve()))
+
+    # 3. HuggingFace 缓存目录
+    for cache_dir in _get_hf_cache_dirs():
+        locations.append(str(cache_dir))
+
+    # 4. 常见的模型存放位置
+    home = Path.home()
+    common_dirs = [
+        home / "models",
+        home / "Models",
+        home / ".cache" / "models",
+        Path("/models"),
+        Path("/data/models"),
+    ]
+    for d in common_dirs:
+        try:
+            if d.exists():
+                locations.append(str(d.resolve()))
+        except (PermissionError, OSError):
+            pass
+
+    # 去重并保持顺序
+    seen = set()
+    result = []
+    for loc in locations:
+        if loc not in seen:
+            seen.add(loc)
+            result.append(loc)
+
+    return result
+
+
 def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
     """构建延迟加载模型的界面 - 先启动UI，后加载模型"""
     # 使用可变容器存储模型状态
@@ -1007,125 +1103,245 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
     output_dir = _ensure_output_dir(args.output_dir)
     save_audio = not args.no_save
 
-    # 启动时扫描当前目录下的模型
-    local_models = _scan_local_models()
-    initial_status = "模型未加载。请选择模型后点击「下载模型」或「加载模型」。"
-    default_model = SUPPORTED_MODELS[0]
-    default_path = ""
+    # 启动时扫描可能的模型位置
+    all_locations = _get_all_model_locations()
+    default_location = all_locations[0] if all_locations else str(Path.cwd())
 
-    if local_models:
-        # 找到本地模型，设置为默认
-        first_local = local_models[0]
-        default_model = first_local["repo_id"]
-        default_path = first_local["path"]
-        model_list = "\n".join([f"  - {m['repo_id']}: {m['path']}" for m in local_models])
-        initial_status = f"检测到本地已下载的模型:\n{model_list}\n\n可以直接点击「加载模型」"
+    # 扫描默认位置的模型
+    initial_models = _scan_models_in_directory(default_location)
+    initial_model_choices = [f"{m['name']} ({m['type']})" for m in initial_models]
+    initial_model_paths = {f"{m['name']} ({m['type']})": m['path'] for m in initial_models}
 
     with gr.Blocks(title="Qwen3-TTS") as demo:
         gr.Markdown("# Qwen3-TTS Jetson Orin")
         gr.Markdown("文本转语音演示 | Text-to-Speech Demo")
 
-        # ===== 模型管理区域 =====
-        with gr.Accordion("模型管理", open=True):
-            with gr.Group():
-                # 模型选择 - 第一行
-                model_dropdown = gr.Dropdown(
-                    label="选择模型",
-                    choices=SUPPORTED_MODELS,
-                    value=default_model,
-                    info="12Hz 更快，25Hz 质量更高 | Base=语音克隆, CustomVoice=预设角色, VoiceDesign=风格描述"
-                )
-                # 本地路径 - 第二行
-                local_path_input = gr.Textbox(
-                    label="本地模型路径 (可选)",
-                    placeholder="留空则使用上方选择的模型，或输入已下载模型的完整路径",
-                    value=default_path,
-                )
+        # 用于存储模型路径映射的状态
+        model_paths_state = gr.State(initial_model_paths)
 
-            # 高级加载选项 - 折叠
-            with gr.Accordion("加载选项", open=False):
-                with gr.Row():
-                    device_input = gr.Dropdown(
-                        label="Device",
-                        choices=["cpu", "cuda", "cuda:0", "auto"],
-                        value=args.device,
-                        allow_custom_value=True,
-                        info="运行设备"
-                    )
-                    dtype_dropdown = gr.Dropdown(
-                        label="精度 (DType)",
-                        choices=["float16", "bfloat16", "float32"],
-                        value="float16" if args.dtype in ["fp16", "float16"] else args.dtype,
-                        info="float16 推荐用于 Jetson"
-                    )
-                    flash_attn_checkbox = gr.Checkbox(
-                        label="FlashAttention-2",
-                        value=not args.no_flash_attn,
-                        info="需要安装 flash-attn"
-                    )
-                    sanitize_logits_checkbox = gr.Checkbox(
-                        label="Sanitize logits",
-                        value=True,
-                        info="避免 CUDA 采样出现 NaN/Inf"
-                    )
-                    staged_load_checkbox = gr.Checkbox(
-                        label="Staged load (CPU→GPU)",
-                        value=bool(args.staged_load),
-                        info="Jetson 推荐，降低 GPU 峰值"
-                    )
-                    tokenizer_cpu_checkbox = gr.Checkbox(
-                        label="Tokenizer on CPU",
-                        value=bool(args.tokenizer_on_cpu),
-                        info="减少 GPU 压力（可能变慢）"
-                    )
+        # ===== 区域1: 模型下载 =====
+        with gr.Accordion("📥 模型下载", open=False):
+            gr.Markdown("从 HuggingFace 下载 Qwen3-TTS 模型到本地")
 
-            # 操作按钮
             with gr.Row():
-                download_btn = gr.Button("下载模型", variant="secondary", scale=1)
-                load_btn = gr.Button("加载模型", variant="primary", scale=2)
+                with gr.Column(scale=2):
+                    download_model_dropdown = gr.Dropdown(
+                        label="选择要下载的模型",
+                        choices=SUPPORTED_MODELS,
+                        value=SUPPORTED_MODELS[0],
+                        info="12Hz 更快，25Hz 质量更高 | Base=语音克隆, CustomVoice=预设角色, VoiceDesign=风格描述"
+                    )
+                with gr.Column(scale=2):
+                    download_dir_input = gr.Textbox(
+                        label="下载位置",
+                        value=default_location,
+                        placeholder="模型将下载到此目录",
+                        info="模型会保存在该目录下的子文件夹中"
+                    )
+                with gr.Column(scale=1):
+                    download_btn = gr.Button("开始下载", variant="primary", size="lg")
 
-            # 状态显示
-            model_status_text = gr.Textbox(
-                label="状态",
-                lines=3,
+            download_status = gr.Textbox(
+                label="下载状态",
+                lines=2,
                 interactive=False,
-                value=initial_status,
-                            )
-
-            # 检查本地是否已有模型
-            def check_local_model(repo_id: str, local_path: str) -> str:
-                path_to_check = local_path.strip() if local_path.strip() else repo_id
-                # 先检查当前目录下的模型
-                local_dir = _get_default_download_dir(path_to_check) if not local_path.strip() else Path(local_path)
-                if local_dir.exists():
-                    has_config, has_weights = _validate_model_dir(local_dir)
-                    if has_config and has_weights:
-                        return f"检测到本地模型: {local_dir}\n可以直接点击「加载模型」"
-                result = _check_model_downloaded(path_to_check)
-                if result["status"] in ("cached", "local_dir"):
-                    return f"检测到缓存模型: {result.get('path', path_to_check)}\n可以直接点击「加载模型」"
-                return f"模型未下载。点击「下载模型」开始下载到当前目录。"
-
-            model_dropdown.change(
-                check_local_model,
-                inputs=[model_dropdown, local_path_input],
-                outputs=[model_status_text]
+                value="选择模型和下载位置后，点击「开始下载」"
             )
 
-            # 下载模型函数
-            def do_download(repo_id: str, local_path: str, progress=gr.Progress()):
-                target_path = local_path.strip() if local_path.strip() else None
+            def do_download(repo_id: str, download_dir: str, progress=gr.Progress()):
+                if not download_dir.strip():
+                    return "请指定下载位置"
+                # 构建目标路径
+                safe_name = repo_id.replace("/", "__")
+                target_path = str(Path(download_dir).expanduser().resolve() / safe_name)
                 return _download_model(repo_id, target_path, progress)
 
             download_btn.click(
                 do_download,
-                inputs=[model_dropdown, local_path_input],
-                outputs=[model_status_text]
+                inputs=[download_model_dropdown, download_dir_input],
+                outputs=[download_status]
             )
 
-        # ===== TTS 生成区域 (初始隐藏) =====
+        # ===== 区域2: 模型选择与加载 =====
+        with gr.Accordion("🔧 模型选择与加载", open=True):
+            with gr.Row():
+                # 左侧: 模型位置和选择
+                with gr.Column(scale=2):
+                    with gr.Group():
+                        gr.Markdown("### 选择模型")
+
+                        model_location_dropdown = gr.Dropdown(
+                            label="模型位置",
+                            choices=all_locations,
+                            value=default_location,
+                            allow_custom_value=True,
+                            info="选择或输入模型所在的目录"
+                        )
+
+                        with gr.Row():
+                            scan_btn = gr.Button("🔍 扫描", scale=1)
+                            auto_detect_btn = gr.Button("🔄 自动检测全部位置", scale=2)
+
+                        model_select_dropdown = gr.Dropdown(
+                            label="检测到的模型",
+                            choices=initial_model_choices,
+                            value=initial_model_choices[0] if initial_model_choices else None,
+                            info="选择要加载的模型"
+                        )
+
+                        model_path_display = gr.Textbox(
+                            label="模型完整路径",
+                            value=initial_models[0]['path'] if initial_models else "",
+                            interactive=True,
+                            info="可直接编辑路径，或通过上方下拉框选择"
+                        )
+
+                # 右侧: 加载选项
+                with gr.Column(scale=1):
+                    with gr.Group():
+                        gr.Markdown("### 加载选项")
+
+                        device_input = gr.Dropdown(
+                            label="Device",
+                            choices=["cpu", "cuda", "cuda:0", "auto"],
+                            value=args.device,
+                            allow_custom_value=True,
+                        )
+                        dtype_dropdown = gr.Dropdown(
+                            label="精度 (DType)",
+                            choices=["float16", "bfloat16", "float32"],
+                            value="float16" if args.dtype in ["fp16", "float16"] else args.dtype,
+                        )
+
+                        with gr.Row():
+                            flash_attn_checkbox = gr.Checkbox(
+                                label="FlashAttn",
+                                value=not args.no_flash_attn,
+                            )
+                            sanitize_logits_checkbox = gr.Checkbox(
+                                label="Sanitize",
+                                value=True,
+                            )
+
+                        with gr.Row():
+                            staged_load_checkbox = gr.Checkbox(
+                                label="Staged",
+                                value=bool(args.staged_load),
+                            )
+                            tokenizer_cpu_checkbox = gr.Checkbox(
+                                label="Tok CPU",
+                                value=bool(args.tokenizer_on_cpu),
+                            )
+
+            # 加载按钮
+            load_btn = gr.Button("🚀 加载模型", variant="primary", size="lg")
+
+            # 状态显示
+            model_status_text = gr.Textbox(
+                label="状态",
+                lines=2,
+                interactive=False,
+                value=f"检测到 {len(initial_models)} 个模型。选择模型后点击「加载模型」" if initial_models else "未检测到模型。请先下载或指定模型位置。"
+            )
+
+            # === 事件处理 ===
+
+            # 扫描指定位置的模型
+            def scan_location(location: str, current_paths: dict):
+                models = _scan_models_in_directory(location)
+                if not models:
+                    return (
+                        gr.update(choices=[], value=None),
+                        "",
+                        current_paths,
+                        f"在 {location} 未找到有效模型"
+                    )
+
+                choices = [f"{m['name']} ({m['type']})" for m in models]
+                paths = {f"{m['name']} ({m['type']})": m['path'] for m in models}
+
+                return (
+                    gr.update(choices=choices, value=choices[0]),
+                    models[0]['path'],
+                    paths,
+                    f"找到 {len(models)} 个模型"
+                )
+
+            scan_btn.click(
+                scan_location,
+                inputs=[model_location_dropdown, model_paths_state],
+                outputs=[model_select_dropdown, model_path_display, model_paths_state, model_status_text]
+            )
+
+            # 位置变化时自动扫描
+            model_location_dropdown.change(
+                scan_location,
+                inputs=[model_location_dropdown, model_paths_state],
+                outputs=[model_select_dropdown, model_path_display, model_paths_state, model_status_text]
+            )
+
+            # 自动检测全部位置
+            def auto_detect_all(current_paths: dict):
+                all_models = []
+                for loc in _get_all_model_locations():
+                    models = _scan_models_in_directory(loc)
+                    for m in models:
+                        m['location'] = loc
+                    all_models.extend(models)
+
+                # 同时扫描 HuggingFace 缓存
+                for repo_id in SUPPORTED_MODELS:
+                    result = _check_model_downloaded(repo_id)
+                    if result["status"] in ("cached", "local_dir"):
+                        path = result.get("path", "")
+                        if path and not any(m['path'] == path for m in all_models):
+                            all_models.append({
+                                "name": repo_id.split("/")[-1],
+                                "path": path,
+                                "type": _detect_model_type(Path(path)),
+                                "location": "HuggingFace Cache"
+                            })
+
+                if not all_models:
+                    return (
+                        gr.update(choices=[], value=None),
+                        "",
+                        current_paths,
+                        "未找到任何模型。请先下载模型。"
+                    )
+
+                choices = [f"{m['name']} ({m['type']}) @ {m.get('location', 'local')}" for m in all_models]
+                paths = {c: m['path'] for c, m in zip(choices, all_models)}
+
+                return (
+                    gr.update(choices=choices, value=choices[0]),
+                    all_models[0]['path'],
+                    paths,
+                    f"共找到 {len(all_models)} 个模型"
+                )
+
+            auto_detect_btn.click(
+                auto_detect_all,
+                inputs=[model_paths_state],
+                outputs=[model_select_dropdown, model_path_display, model_paths_state, model_status_text]
+            )
+
+            # 选择模型时更新路径
+            def on_model_select(selection: str, paths: dict):
+                if selection and selection in paths:
+                    return paths[selection]
+                return ""
+
+            model_select_dropdown.change(
+                on_model_select,
+                inputs=[model_select_dropdown, model_paths_state],
+                outputs=[model_path_display]
+            )
+
+        # ===== 区域3: TTS 生成 (初始隐藏) =====
         with gr.Column(visible=False) as tts_area:
             gr.Markdown("---")
+            gr.Markdown("## 🎙️ 语音合成")
 
             # Base 模式 UI
             with gr.Tab("语音克隆 (Base)", visible=False) as base_tab:
@@ -1274,40 +1490,57 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
         )
 
         # ===== 加载模型逻辑 =====
-        def load_model_fn(repo_id: str, local_path: str, device_in: str, dtype_in: str, flash_attn_in: bool, sanitize_logits_in: bool, staged_load_in: bool, tokenizer_cpu_in: bool):
+        def load_model_fn(model_path: str, device_in: str, dtype_in: str, flash_attn_in: bool, sanitize_logits_in: bool, staged_load_in: bool, tokenizer_cpu_in: bool):
             nonlocal state
+
+            if not model_path or not model_path.strip():
+                return (
+                    "请先选择或输入模型路径",
+                    gr.update(visible=False),
+                    "",
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.update(choices=[], value=None),
+                )
+
             try:
-                # 应用当前 UI 中的加载参数
+                checkpoint = model_path.strip()
+
+                # 验证模型路径
+                model_dir = Path(checkpoint)
+                if model_dir.exists():
+                    has_config, has_weights = _validate_model_dir(model_dir)
+                    if not has_config or not has_weights:
+                        return (
+                            f"无效的模型路径: {checkpoint}\n缺少 config.json 或权重文件",
+                            gr.update(visible=False),
+                            "",
+                            gr.update(visible=False),
+                            gr.update(visible=False),
+                            gr.update(visible=False),
+                            gr.update(choices=[], value=None),
+                        )
+
+                # 应用加载参数
                 args.device = (device_in or "").strip() or args.device
                 args.dtype = (dtype_in or "").strip() or args.dtype
                 args.no_flash_attn = not bool(flash_attn_in)
                 args.staged_load = bool(staged_load_in)
                 args.tokenizer_on_cpu = bool(tokenizer_cpu_in)
+
                 if args.device.lower().startswith("cpu") and args.dtype.lower() in ("bfloat16", "bf16", "float16", "fp16"):
                     print("[Info] CPU 模式下将 dtype 自动切换为 float32，以避免 NaN/Inf。")
                     args.dtype = "float32"
-                state["sanitize_logits"] = bool(sanitize_logits_in)
 
-                # 确定模型路径
-                if local_path.strip():
-                    checkpoint = local_path.strip()
-                else:
-                    # 先检查当前目录下载的模型
-                    local_dir = _get_default_download_dir(repo_id)
-                    if local_dir.exists():
-                        has_config, has_weights = _validate_model_dir(local_dir)
-                        if has_config and has_weights:
-                            checkpoint = str(local_dir)
-                        else:
-                            checkpoint = repo_id
-                    else:
-                        checkpoint = repo_id
+                state["sanitize_logits"] = bool(sanitize_logits_in)
 
                 # 加载模型
                 args.checkpoint = checkpoint
                 tts = _load_tts(args)
                 model_type = getattr(tts.model, "tts_model_type", "")
                 print(f"[Load] model_type={model_type} | model_device={_infer_model_device(tts.model)}")
+
                 try:
                     st = getattr(tts.model, "speech_tokenizer", None)
                     st_model = getattr(st, "model", None) if st is not None else None
@@ -1326,10 +1559,9 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                     speakers = tts.model.get_supported_speakers() or []
 
                 status_msg = (
-                    f"模型加载成功!\n路径: {checkpoint}\n类型: {model_type}\n"
-                    f"device={args.device} | dtype={args.dtype} | flash_attn={'on' if not args.no_flash_attn else 'off'} | "
-                    f"sanitize_logits={'on' if state.get('sanitize_logits', False) else 'off'} | staged_load={'on' if args.staged_load else 'off'} | "
-                    f"tokenizer_on_cpu={'on' if args.tokenizer_on_cpu else 'off'}"
+                    f"✅ 模型加载成功!\n"
+                    f"路径: {checkpoint}\n"
+                    f"类型: {model_type} | device={args.device} | dtype={args.dtype}"
                 )
                 sys_check = _system_check_summary(checkpoint, output_dir)
 
@@ -1344,7 +1576,9 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                     gr.update(choices=speakers, value=speakers[0] if speakers else None),  # custom_speaker
                 )
             except Exception as e:
-                error_msg = f"模型加载失败: {str(e)}"
+                import traceback
+                traceback.print_exc()
+                error_msg = f"❌ 模型加载失败: {str(e)}"
                 return (
                     error_msg,
                     gr.update(visible=False),
@@ -1357,7 +1591,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
         load_btn.click(
             load_model_fn,
-            inputs=[model_dropdown, local_path_input, device_input, dtype_dropdown, flash_attn_checkbox, sanitize_logits_checkbox, staged_load_checkbox, tokenizer_cpu_checkbox],
+            inputs=[model_path_display, device_input, dtype_dropdown, flash_attn_checkbox, sanitize_logits_checkbox, staged_load_checkbox, tokenizer_cpu_checkbox],
             outputs=[model_status_text, tts_area, sys_info, base_tab, custom_tab, design_tab, custom_speaker]
         )
 
