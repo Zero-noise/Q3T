@@ -739,7 +739,7 @@ def build_download_ui() -> gr.Blocks:
             use_custom_dir.change(toggle_custom_dir, inputs=[use_custom_dir], outputs=[custom_dir])
 
             download_btn = gr.Button("开始下载", variant="primary")
-            download_status = gr.Textbox(label="下载状态", lines=5, interactive=False, show_copy_button=True)
+            download_status = gr.Textbox(label="下载状态", lines=5, interactive=False)
 
             def do_download(model, use_custom, custom_path, progress=gr.Progress()):
                 local_dir = custom_path if use_custom and custom_path.strip() else None
@@ -761,7 +761,7 @@ def build_download_ui() -> gr.Blocks:
                     scale=3
                 )
                 check_btn = gr.Button("检查", scale=1)
-            check_result = gr.Textbox(label="检查结果", lines=3, interactive=False, show_copy_button=True)
+            check_result = gr.Textbox(label="检查结果", lines=3, interactive=False)
 
             def check_manual_path(path):
                 if not path or not path.strip():
@@ -807,7 +807,7 @@ def build_demo(tts: Qwen3TTSModel, checkpoint: str, output_dir: str, save_audio:
             gr.Markdown(f"⚠️ 不支持的模型类型: {model_type}")
 
         with gr.Accordion("系统状态", open=False):
-            sys_info = gr.Textbox(label="详细信息", lines=6, value=_system_check_summary(checkpoint, output_dir), show_copy_button=True)
+            sys_info = gr.Textbox(label="详细信息", lines=6, value=_system_check_summary(checkpoint, output_dir))
             refresh_btn = gr.Button("刷新")
 
             def _refresh() -> str:
@@ -1132,7 +1132,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
             # 系统状态放在最后
             with gr.Accordion("系统状态", open=False):
-                sys_info = gr.Textbox(label="详细信息", lines=6, value="", show_copy_button=True)
+                sys_info = gr.Textbox(label="详细信息", lines=6, value="")
                 refresh_btn = gr.Button("刷新")
 
         gr.Markdown("---")
