@@ -19,6 +19,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import gradio as gr
 import numpy as np
 import torch
+from transformers.generation.logits_process import LogitsProcessorList
+
+class _NanClampLogitsProcessor:
+    def __call__(self, input_ids, scores):
+        if torch.isnan(scores).any() or torch.isinf(scores).any():
+            scores = torch.nan_to_num(scores, nan=-1e4, posinf=-1e4, neginf=-1e4)
+        return scores
 
 def _add_local_qwen_repo() -> None:
     env_root = os.getenv("QWEN3_TTS_ROOT")
@@ -149,6 +156,27 @@ def _check_cuda_mem() -> Dict[str, Optional[int]]:
         free, total = torch.cuda.mem_get_info()
         return {"total": int(total), "free": int(free), "used": int(total - free)}
     return {"total": None, "free": None, "used": None}
+
+
+def _cuda_brief_info() -> str:
+    if not torch.cuda.is_available():
+        return "CUDA available: False"
+    try:
+        idx = torch.cuda.current_device()
+        name = torch.cuda.get_device_name(idx)
+    except Exception:
+        idx = "unknown"
+        name = "unknown"
+    return f"CUDA available: True | current_device={idx} | name={name}"
+
+
+def _infer_model_device(model: torch.nn.Module) -> str:
+    try:
+        p = next(model.parameters())
+        return str(p.device)
+    except Exception:
+        dev = getattr(model, "device", None)
+        return str(dev) if dev is not None else "unknown"
 
 
 # 支持的 Qwen3-TTS 模型列表
@@ -395,9 +423,26 @@ def _collect_gen_kwargs(max_new_tokens, temperature, top_k, top_p, repetition_pe
     return {k: v for k, v in mapping.items() if v is not None}
 
 
+def _build_logits_processor(enabled: bool) -> Optional[LogitsProcessorList]:
+    if not enabled:
+        return None
+    return LogitsProcessorList([_NanClampLogitsProcessor()])
+
+
 def _load_tts(args: argparse.Namespace) -> Qwen3TTSModel:
     dtype = _dtype_from_str(args.dtype)
     attn_impl = None if args.no_flash_attn else "flash_attention_2"
+    device_map = args.device
+    if isinstance(device_map, str) and device_map.startswith("cuda:"):
+        parts = device_map.split(":", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            try:
+                torch.cuda.set_device(int(parts[1]))
+            except Exception:
+                pass
+        device_map = "cuda"
+    print(f"[Load] device_map={device_map} (from '{args.device}') | dtype={dtype} | flash_attn={'on' if attn_impl else 'off'}")
+    print(f"[Load] { _cuda_brief_info() }")
 
     # 在加载前清理 GPU 缓存
     if torch.cuda.is_available():
@@ -407,7 +452,7 @@ def _load_tts(args: argparse.Namespace) -> Qwen3TTSModel:
 
     return Qwen3TTSModel.from_pretrained(
         args.checkpoint,
-        device_map=args.device,
+        device_map=device_map,
         torch_dtype=dtype,
         attn_implementation=attn_impl,
         low_cpu_mem_usage=True,  # 减少加载时的内存峰值
@@ -835,9 +880,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cpu", help="Device for device_map (default: cpu).")
     parser.add_argument(
         "--dtype",
-        default="float16",
+        default="float32",
         choices=["bfloat16", "bf16", "float16", "fp16", "float32", "fp32"],
-        help="Torch dtype for loading the model (default: float16).",
+        help="Torch dtype for loading the model (default: float32).",
     )
     parser.add_argument(
         "--no-flash-attn",
@@ -887,7 +932,7 @@ def _scan_local_models() -> List[Dict[str, Any]]:
 def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
     """构建延迟加载模型的界面 - 先启动UI，后加载模型"""
     # 使用可变容器存储模型状态
-    state = {"tts": None, "checkpoint": None, "model_type": None}
+    state = {"tts": None, "checkpoint": None, "model_type": None, "sanitize_logits": True}
     output_dir = _ensure_output_dir(args.output_dir)
     save_audio = not args.no_save
 
@@ -946,6 +991,11 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                         label="FlashAttention-2",
                         value=not args.no_flash_attn,
                         info="需要安装 flash-attn"
+                    )
+                    sanitize_logits_checkbox = gr.Checkbox(
+                        label="Sanitize logits",
+                        value=True,
+                        info="避免 CUDA 采样出现 NaN/Inf"
                     )
 
             # 操作按钮
@@ -1143,13 +1193,17 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
         )
 
         # ===== 加载模型逻辑 =====
-        def load_model_fn(repo_id: str, local_path: str, device_in: str, dtype_in: str, flash_attn_in: bool):
+        def load_model_fn(repo_id: str, local_path: str, device_in: str, dtype_in: str, flash_attn_in: bool, sanitize_logits_in: bool):
             nonlocal state
             try:
                 # 应用当前 UI 中的加载参数
                 args.device = (device_in or "").strip() or args.device
                 args.dtype = (dtype_in or "").strip() or args.dtype
                 args.no_flash_attn = not bool(flash_attn_in)
+                if args.device.lower().startswith("cpu") and args.dtype.lower() in ("bfloat16", "bf16", "float16", "fp16"):
+                    print("[Info] CPU 模式下将 dtype 自动切换为 float32，以避免 NaN/Inf。")
+                    args.dtype = "float32"
+                state["sanitize_logits"] = bool(sanitize_logits_in)
 
                 # 确定模型路径
                 if local_path.strip():
@@ -1170,6 +1224,14 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 args.checkpoint = checkpoint
                 tts = _load_tts(args)
                 model_type = getattr(tts.model, "tts_model_type", "")
+                print(f"[Load] model_type={model_type} | model_device={_infer_model_device(tts.model)}")
+                try:
+                    st = getattr(tts.model, "speech_tokenizer", None)
+                    st_model = getattr(st, "model", None) if st is not None else None
+                    if st_model is not None:
+                        print(f"[Load] speech_tokenizer_device={_infer_model_device(st_model)}")
+                except Exception:
+                    pass
 
                 state["tts"] = tts
                 state["checkpoint"] = checkpoint
@@ -1182,7 +1244,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
                 status_msg = (
                     f"模型加载成功!\n路径: {checkpoint}\n类型: {model_type}\n"
-                    f"device={args.device} | dtype={args.dtype} | flash_attn={'on' if not args.no_flash_attn else 'off'}"
+                    f"device={args.device} | dtype={args.dtype} | flash_attn={'on' if not args.no_flash_attn else 'off'} | sanitize_logits={'on' if state.get('sanitize_logits', False) else 'off'}"
                 )
                 sys_check = _system_check_summary(checkpoint, output_dir)
 
@@ -1210,7 +1272,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
         load_btn.click(
             load_model_fn,
-            inputs=[model_dropdown, local_path_input, device_input, dtype_dropdown, flash_attn_checkbox],
+            inputs=[model_dropdown, local_path_input, device_input, dtype_dropdown, flash_attn_checkbox, sanitize_logits_checkbox],
             outputs=[model_status_text, tts_area, sys_info, base_tab, custom_tab, design_tab, custom_speaker]
         )
 
@@ -1239,6 +1301,9 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 _coerce_float(top_p_in, 0.9),
                 _coerce_float(repetition_penalty_in, 1.05),
             )
+            logits_processor = _build_logits_processor(state.get("sanitize_logits", False))
+            if logits_processor is not None:
+                gen_kwargs["logits_processor"] = logits_processor
             wavs, sr = state["tts"].generate_voice_clone(
                 text=text_in,
                 language=_maybe_auto_language(lang_in),
@@ -1274,6 +1339,9 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 _coerce_float(top_p_in, 0.9),
                 _coerce_float(repetition_penalty_in, 1.05),
             )
+            logits_processor = _build_logits_processor(state.get("sanitize_logits", False))
+            if logits_processor is not None:
+                gen_kwargs["logits_processor"] = logits_processor
             wavs, sr = state["tts"].generate_custom_voice(
                 text=text_in,
                 language=_maybe_auto_language(lang_in),
@@ -1306,6 +1374,9 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 _coerce_float(top_p_in, 0.9),
                 _coerce_float(repetition_penalty_in, 1.05),
             )
+            logits_processor = _build_logits_processor(state.get("sanitize_logits", False))
+            if logits_processor is not None:
+                gen_kwargs["logits_processor"] = logits_processor
             wavs, sr = state["tts"].generate_voice_design(
                 text=text_in,
                 language=_maybe_auto_language(lang_in),
