@@ -699,14 +699,9 @@ def _download_model(repo_id: str, local_dir: Optional[str], progress=gr.Progress
 
 def build_download_ui() -> gr.Blocks:
     """构建模型下载界面"""
-    custom_css = """
-    .gradio-container {max-width: 100% !important;}
-    .main-title {text-align: center; margin-bottom: 0.5em;}
-    .sub-title {text-align: center; color: #666; font-size: 0.95em; margin-top: 0;}
-    """
-    with gr.Blocks(css=custom_css, title="Qwen3-TTS 下载") as demo:
-        gr.Markdown("# Qwen3-TTS 模型下载", elem_classes=["main-title"])
-        gr.Markdown("检测到本地没有可用的模型，请先下载模型", elem_classes=["sub-title"])
+    with gr.Blocks(title="Qwen3-TTS 下载") as demo:
+        gr.Markdown("# Qwen3-TTS 模型下载")
+        gr.Markdown("检测到本地没有可用的模型，请先下载模型")
 
         # 显示已缓存的模型
         cached_models = _scan_all_cached_models()
@@ -797,14 +792,9 @@ def build_download_ui() -> gr.Blocks:
 
 
 def build_demo(tts: Qwen3TTSModel, checkpoint: str, output_dir: str, save_audio: bool) -> gr.Blocks:
-    custom_css = """
-    .gradio-container {max-width: 100% !important;}
-    .main-title {text-align: center; margin-bottom: 0.5em;}
-    .sub-title {text-align: center; color: #666; font-size: 0.95em; margin-top: 0;}
-    """
-    with gr.Blocks(css=custom_css, title="Qwen3-TTS") as demo:
-        gr.Markdown("# Qwen3-TTS Jetson Orin", elem_classes=["main-title"])
-        gr.Markdown("文本转语音演示 | Text-to-Speech Demo", elem_classes=["sub-title"])
+    with gr.Blocks(title="Qwen3-TTS") as demo:
+        gr.Markdown("# Qwen3-TTS Jetson Orin")
+        gr.Markdown("文本转语音演示 | Text-to-Speech Demo")
 
         model_type = getattr(tts.model, "tts_model_type", "")
         if model_type == "base":
@@ -818,7 +808,7 @@ def build_demo(tts: Qwen3TTSModel, checkpoint: str, output_dir: str, save_audio:
 
         with gr.Accordion("系统状态", open=False):
             sys_info = gr.Textbox(label="详细信息", lines=6, value=_system_check_summary(checkpoint, output_dir), show_copy_button=True)
-            refresh_btn = gr.Button("刷新", size="sm")
+            refresh_btn = gr.Button("刷新")
 
             def _refresh() -> str:
                 return _system_check_summary(checkpoint, output_dir)
@@ -915,19 +905,9 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
         model_list = "\n".join([f"  - {m['repo_id']}: {m['path']}" for m in local_models])
         initial_status = f"检测到本地已下载的模型:\n{model_list}\n\n可以直接点击「加载模型」"
 
-    # 自定义 CSS 样式
-    custom_css = """
-    .gradio-container {max-width: 100% !important;}
-    .main-title {text-align: center; margin-bottom: 0.5em;}
-    .sub-title {text-align: center; color: #666; font-size: 0.95em; margin-top: 0;}
-    .status-box {background: #f8f9fa; border-radius: 8px; padding: 12px; border: 1px solid #e9ecef;}
-    .gen-btn {min-height: 45px !important;}
-    .param-group {background: #fafafa; border-radius: 6px; padding: 10px; margin-top: 8px;}
-    """
-
-    with gr.Blocks(css=custom_css, title="Qwen3-TTS") as demo:
-        gr.Markdown("# Qwen3-TTS Jetson Orin", elem_classes=["main-title"])
-        gr.Markdown("文本转语音演示 | Text-to-Speech Demo", elem_classes=["sub-title"])
+    with gr.Blocks(title="Qwen3-TTS") as demo:
+        gr.Markdown("# Qwen3-TTS Jetson Orin")
+        gr.Markdown("文本转语音演示 | Text-to-Speech Demo")
 
         # ===== 模型管理区域 =====
         with gr.Accordion("模型管理", open=True):
@@ -971,7 +951,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
             # 操作按钮
             with gr.Row():
                 download_btn = gr.Button("下载模型", variant="secondary", scale=1)
-                load_btn = gr.Button("加载模型", variant="primary", scale=2, elem_classes=["gen-btn"])
+                load_btn = gr.Button("加载模型", variant="primary", scale=2)
 
             # 状态显示
             model_status_text = gr.Textbox(
@@ -979,8 +959,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 lines=3,
                 interactive=False,
                 value=initial_status,
-                show_copy_button=True
-            )
+                            )
 
             # 检查本地是否已有模型
             def check_local_model(repo_id: str, local_path: str) -> str:
@@ -1062,7 +1041,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                         base_top_p = gr.Slider(label="top_p", minimum=0.1, maximum=1.0, value=0.9, step=0.05)
                         base_rep_pen = gr.Slider(label="repetition_penalty", minimum=1.0, maximum=2.0, value=1.05, step=0.01)
 
-                base_gen_btn = gr.Button("生成语音", variant="primary", elem_classes=["gen-btn"])
+                base_gen_btn = gr.Button("生成语音", variant="primary")
 
                 with gr.Row():
                     base_audio_out = gr.Audio(label="生成结果", type="numpy", scale=3)
@@ -1106,7 +1085,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                         custom_top_p = gr.Slider(label="top_p", minimum=0.1, maximum=1.0, value=0.9, step=0.05)
                         custom_rep_pen = gr.Slider(label="repetition_penalty", minimum=1.0, maximum=2.0, value=1.05, step=0.01)
 
-                custom_gen_btn = gr.Button("生成语音", variant="primary", elem_classes=["gen-btn"])
+                custom_gen_btn = gr.Button("生成语音", variant="primary")
 
                 with gr.Row():
                     custom_audio_out = gr.Audio(label="生成结果", type="numpy", scale=3)
@@ -1145,7 +1124,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                         design_top_p = gr.Slider(label="top_p", minimum=0.1, maximum=1.0, value=0.9, step=0.05)
                         design_rep_pen = gr.Slider(label="repetition_penalty", minimum=1.0, maximum=2.0, value=1.05, step=0.01)
 
-                design_gen_btn = gr.Button("生成语音", variant="primary", elem_classes=["gen-btn"])
+                design_gen_btn = gr.Button("生成语音", variant="primary")
 
                 with gr.Row():
                     design_audio_out = gr.Audio(label="生成结果", type="numpy", scale=3)
@@ -1154,7 +1133,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
             # 系统状态放在最后
             with gr.Accordion("系统状态", open=False):
                 sys_info = gr.Textbox(label="详细信息", lines=6, value="", show_copy_button=True)
-                refresh_btn = gr.Button("刷新", size="sm")
+                refresh_btn = gr.Button("刷新")
 
         gr.Markdown("---")
         gr.Markdown(
