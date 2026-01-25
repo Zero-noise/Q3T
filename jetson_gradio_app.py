@@ -179,6 +179,21 @@ def _infer_model_device(model: torch.nn.Module) -> str:
         return str(dev) if dev is not None else "unknown"
 
 
+def _move_speech_tokenizer(st, device: str, dtype: Optional[torch.dtype]) -> None:
+    if st is None:
+        return
+    target_device = torch.device(device)
+    target_dtype = dtype
+    if target_device.type == "cpu" and target_dtype in (torch.float16, torch.bfloat16):
+        target_dtype = torch.float32
+    if getattr(st, "model", None) is not None:
+        if target_dtype is not None:
+            st.model = st.model.to(device=target_device, dtype=target_dtype)
+        else:
+            st.model = st.model.to(device=target_device)
+    st.device = target_device
+
+
 # 支持的 Qwen3-TTS 模型列表
 SUPPORTED_MODELS = [
     "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
@@ -450,13 +465,45 @@ def _load_tts(args: argparse.Namespace) -> Qwen3TTSModel:
         import gc
         gc.collect()
 
-    return Qwen3TTSModel.from_pretrained(
+    use_staged = bool(getattr(args, "staged_load", False))
+    tokenizer_on_cpu = bool(getattr(args, "tokenizer_on_cpu", False))
+    print(f"[Load] staged_load={'on' if use_staged else 'off'} | tokenizer_on_cpu={'on' if tokenizer_on_cpu else 'off'}")
+
+    if use_staged and device_map == "cuda":
+        print("[Load] staged_load path: CPU -> dtype -> GPU")
+        tts = Qwen3TTSModel.from_pretrained(
+            args.checkpoint,
+            device_map="cpu",
+            torch_dtype=dtype if dtype not in (torch.float16, torch.bfloat16) else torch.float32,
+            attn_implementation=attn_impl,
+            low_cpu_mem_usage=True,
+        )
+        if dtype in (torch.float16, torch.bfloat16):
+            tts.model = tts.model.to(dtype=dtype)
+        tts.model = tts.model.to("cuda")
+        tts.device = torch.device("cuda")
+        if hasattr(tts.model, "device"):
+            tts.model.device = torch.device("cuda")
+        if hasattr(tts.model, "speech_tokenizer"):
+            st = getattr(tts.model, "speech_tokenizer", None)
+            if tokenizer_on_cpu:
+                _move_speech_tokenizer(st, "cpu", dtype)
+            else:
+                _move_speech_tokenizer(st, "cuda", dtype)
+        return tts
+
+    tts = Qwen3TTSModel.from_pretrained(
         args.checkpoint,
         device_map=device_map,
         torch_dtype=dtype,
         attn_implementation=attn_impl,
         low_cpu_mem_usage=True,  # 减少加载时的内存峰值
     )
+    if hasattr(tts.model, "speech_tokenizer"):
+        st = getattr(tts.model, "speech_tokenizer", None)
+        if tokenizer_on_cpu:
+            _move_speech_tokenizer(st, "cpu", dtype)
+    return tts
 
 
 def _build_base_ui(tts: Qwen3TTSModel, output_dir: str, save_audio: bool):
@@ -897,6 +944,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Enable FlashAttention-2.",
     )
+    parser.add_argument(
+        "--staged-load",
+        action="store_true",
+        default=True,
+        help="Staged load for Jetson (CPU -> dtype -> GPU).",
+    )
+    parser.add_argument(
+        "--no-staged-load",
+        dest="staged_load",
+        action="store_false",
+        help="Disable staged load.",
+    )
+    parser.add_argument(
+        "--tokenizer-on-cpu",
+        action="store_true",
+        default=True,
+        help="Keep speech tokenizer on CPU (reduce GPU memory).",
+    )
+    parser.add_argument(
+        "--tokenizer-on-gpu",
+        dest="tokenizer_on_cpu",
+        action="store_false",
+        help="Move speech tokenizer to GPU.",
+    )
     parser.add_argument("--ip", default="0.0.0.0", help="Gradio server bind IP.")
     parser.add_argument("--port", type=int, default=8000, help="Gradio server port.")
     parser.add_argument("--share", action="store_true", help="Create a public Gradio link.")
@@ -996,6 +1067,16 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                         label="Sanitize logits",
                         value=True,
                         info="避免 CUDA 采样出现 NaN/Inf"
+                    )
+                    staged_load_checkbox = gr.Checkbox(
+                        label="Staged load (CPU→GPU)",
+                        value=bool(args.staged_load),
+                        info="Jetson 推荐，降低 GPU 峰值"
+                    )
+                    tokenizer_cpu_checkbox = gr.Checkbox(
+                        label="Tokenizer on CPU",
+                        value=bool(args.tokenizer_on_cpu),
+                        info="减少 GPU 压力（可能变慢）"
                     )
 
             # 操作按钮
@@ -1193,13 +1274,15 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
         )
 
         # ===== 加载模型逻辑 =====
-        def load_model_fn(repo_id: str, local_path: str, device_in: str, dtype_in: str, flash_attn_in: bool, sanitize_logits_in: bool):
+        def load_model_fn(repo_id: str, local_path: str, device_in: str, dtype_in: str, flash_attn_in: bool, sanitize_logits_in: bool, staged_load_in: bool, tokenizer_cpu_in: bool):
             nonlocal state
             try:
                 # 应用当前 UI 中的加载参数
                 args.device = (device_in or "").strip() or args.device
                 args.dtype = (dtype_in or "").strip() or args.dtype
                 args.no_flash_attn = not bool(flash_attn_in)
+                args.staged_load = bool(staged_load_in)
+                args.tokenizer_on_cpu = bool(tokenizer_cpu_in)
                 if args.device.lower().startswith("cpu") and args.dtype.lower() in ("bfloat16", "bf16", "float16", "fp16"):
                     print("[Info] CPU 模式下将 dtype 自动切换为 float32，以避免 NaN/Inf。")
                     args.dtype = "float32"
@@ -1244,7 +1327,9 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
                 status_msg = (
                     f"模型加载成功!\n路径: {checkpoint}\n类型: {model_type}\n"
-                    f"device={args.device} | dtype={args.dtype} | flash_attn={'on' if not args.no_flash_attn else 'off'} | sanitize_logits={'on' if state.get('sanitize_logits', False) else 'off'}"
+                    f"device={args.device} | dtype={args.dtype} | flash_attn={'on' if not args.no_flash_attn else 'off'} | "
+                    f"sanitize_logits={'on' if state.get('sanitize_logits', False) else 'off'} | staged_load={'on' if args.staged_load else 'off'} | "
+                    f"tokenizer_on_cpu={'on' if args.tokenizer_on_cpu else 'off'}"
                 )
                 sys_check = _system_check_summary(checkpoint, output_dir)
 
@@ -1272,7 +1357,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
         load_btn.click(
             load_model_fn,
-            inputs=[model_dropdown, local_path_input, device_input, dtype_dropdown, flash_attn_checkbox, sanitize_logits_checkbox],
+            inputs=[model_dropdown, local_path_input, device_input, dtype_dropdown, flash_attn_checkbox, sanitize_logits_checkbox, staged_load_checkbox, tokenizer_cpu_checkbox],
             outputs=[model_status_text, tts_area, sys_info, base_tab, custom_tab, design_tab, custom_speaker]
         )
 
