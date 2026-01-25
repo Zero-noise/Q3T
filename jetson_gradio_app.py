@@ -1304,6 +1304,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
             logits_processor = _build_logits_processor(state.get("sanitize_logits", False))
             if logits_processor is not None:
                 gen_kwargs["logits_processor"] = logits_processor
+                gen_kwargs["subtalker_dosample"] = False
             wavs, sr = state["tts"].generate_voice_clone(
                 text=text_in,
                 language=_maybe_auto_language(lang_in),
@@ -1342,6 +1343,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
             logits_processor = _build_logits_processor(state.get("sanitize_logits", False))
             if logits_processor is not None:
                 gen_kwargs["logits_processor"] = logits_processor
+                gen_kwargs["subtalker_dosample"] = False
             wavs, sr = state["tts"].generate_custom_voice(
                 text=text_in,
                 language=_maybe_auto_language(lang_in),
@@ -1377,6 +1379,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
             logits_processor = _build_logits_processor(state.get("sanitize_logits", False))
             if logits_processor is not None:
                 gen_kwargs["logits_processor"] = logits_processor
+                gen_kwargs["subtalker_dosample"] = False
             wavs, sr = state["tts"].generate_voice_design(
                 text=text_in,
                 language=_maybe_auto_language(lang_in),
