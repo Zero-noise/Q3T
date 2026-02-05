@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import os
+import re
+import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -159,6 +163,248 @@ def _check_cuda_mem() -> Dict[str, Optional[int]]:
         free, total = torch.cuda.mem_get_info()
         return {"total": int(total), "free": int(free), "used": int(total - free)}
     return {"total": None, "free": None, "used": None}
+
+
+class JetsonMonitor:
+    """Parse tegrastats output for real-time Jetson hardware monitoring."""
+
+    def __init__(self):
+        self._data: Dict[str, Any] = {}
+        self._lock = threading.Lock()
+        self._process: Optional[subprocess.Popen] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._process:
+            try:
+                self._process.terminate()
+            except Exception:
+                pass
+
+    def _poll_loop(self) -> None:
+        """Try tegrastats first, fall back to sysfs readings."""
+        try:
+            self._process = subprocess.Popen(
+                ["tegrastats", "--interval", "2000"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            for line in iter(self._process.stdout.readline, ""):
+                if not self._running:
+                    break
+                self._parse_tegrastats(line.strip())
+        except (FileNotFoundError, PermissionError):
+            # tegrastats not available or no permission, use sysfs fallback
+            while self._running:
+                self._read_sysfs()
+                time.sleep(2)
+
+    def _parse_tegrastats(self, line: str) -> None:
+        """Parse a single tegrastats output line."""
+        data: Dict[str, Any] = {}
+
+        # RAM: 3456/7620MB
+        ram_match = re.search(r"RAM\s+(\d+)/(\d+)MB", line)
+        if ram_match:
+            data["ram_used_mb"] = int(ram_match.group(1))
+            data["ram_total_mb"] = int(ram_match.group(2))
+
+        # SWAP: 0/8192MB
+        swap_match = re.search(r"SWAP\s+(\d+)/(\d+)MB", line)
+        if swap_match:
+            data["swap_used_mb"] = int(swap_match.group(1))
+            data["swap_total_mb"] = int(swap_match.group(2))
+
+        # GR3D_FREQ 45%
+        gr3d_match = re.search(r"GR3D_FREQ\s+(\d+)%", line)
+        if gr3d_match:
+            data["gpu_util_pct"] = int(gr3d_match.group(1))
+
+        # CPU temperatures: CPU@45.5C or cpu@45.5C
+        cpu_temp_match = re.search(r"[Cc][Pp][Uu]@([\d.]+)C", line)
+        if cpu_temp_match:
+            data["cpu_temp_c"] = float(cpu_temp_match.group(1))
+
+        # GPU temperature: GPU@42C or gpu@42C
+        gpu_temp_match = re.search(r"[Gg][Pp][Uu]@([\d.]+)C", line)
+        if gpu_temp_match:
+            data["gpu_temp_c"] = float(gpu_temp_match.group(1))
+
+        # VDD_IN power: VDD_IN 4500mW or VDD_IN 4500/5000
+        vdd_match = re.search(r"VDD_IN\s+(\d+)(?:mW|/\d+)", line)
+        if vdd_match:
+            data["power_mw"] = int(vdd_match.group(1))
+
+        with self._lock:
+            self._data.update(data)
+
+    def _read_sysfs(self) -> None:
+        """Fallback: read temperatures from sysfs thermal zones."""
+        data: Dict[str, Any] = {}
+        thermal_base = Path("/sys/devices/virtual/thermal")
+        if thermal_base.exists():
+            for tz in sorted(thermal_base.glob("thermal_zone*")):
+                try:
+                    tz_type = (tz / "type").read_text().strip().lower()
+                    temp_raw = (tz / "temp").read_text().strip()
+                    temp_c = int(temp_raw) / 1000.0
+                    if "gpu" in tz_type:
+                        data["gpu_temp_c"] = temp_c
+                    elif "cpu" in tz_type or "soc" in tz_type:
+                        data.setdefault("cpu_temp_c", temp_c)
+                except (OSError, ValueError):
+                    continue
+
+        with self._lock:
+            self._data.update(data)
+
+    def get_data(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._data)
+
+    def format_summary(self) -> str:
+        d = self.get_data()
+        if not d:
+            return "Jetson 监控: 等待数据..."
+
+        lines = []
+        # Temperatures
+        gpu_temp = d.get("gpu_temp_c")
+        cpu_temp = d.get("cpu_temp_c")
+        if gpu_temp is not None or cpu_temp is not None:
+            temp_parts = []
+            if gpu_temp is not None:
+                temp_parts.append(f"GPU {gpu_temp:.0f}°C")
+            if cpu_temp is not None:
+                temp_parts.append(f"CPU {cpu_temp:.0f}°C")
+            lines.append(f"温度: {' | '.join(temp_parts)}")
+
+        # GPU utilization
+        gpu_util = d.get("gpu_util_pct")
+        if gpu_util is not None:
+            lines.append(f"GPU 利用率: {gpu_util}%")
+
+        # Power
+        power = d.get("power_mw")
+        if power is not None:
+            lines.append(f"功耗: {power/1000:.1f} W")
+
+        # RAM
+        ram_used = d.get("ram_used_mb")
+        ram_total = d.get("ram_total_mb")
+        if ram_used is not None and ram_total is not None:
+            lines.append(f"RAM: {ram_used}/{ram_total} MB ({ram_used*100//ram_total}%)")
+
+        # Swap
+        swap_used = d.get("swap_used_mb")
+        swap_total = d.get("swap_total_mb")
+        if swap_used is not None and swap_total is not None:
+            lines.append(f"Swap: {swap_used}/{swap_total} MB")
+
+        return "\n".join(lines) if lines else "Jetson 监控: 无数据"
+
+
+class InferenceTracker:
+    """Track inference latency and compute RTF (Real-Time Factor)."""
+
+    def __init__(self, max_history: int = 100):
+        self._history: List[Dict[str, float]] = []
+        self._max_history = max_history
+        self._lock = threading.Lock()
+
+    def record(self, latency_s: float, text_len: int, audio_len_s: float) -> None:
+        rtf = latency_s / audio_len_s if audio_len_s > 0 else float("inf")
+        entry = {
+            "latency_s": latency_s,
+            "text_len": text_len,
+            "audio_len_s": audio_len_s,
+            "rtf": rtf,
+            "timestamp": time.time(),
+        }
+        with self._lock:
+            self._history.append(entry)
+            if len(self._history) > self._max_history:
+                self._history = self._history[-self._max_history:]
+
+    def format_summary(self) -> str:
+        with self._lock:
+            history = list(self._history)
+
+        if not history:
+            return "推理统计: 暂无数据"
+
+        n = len(history)
+        avg_latency = sum(e["latency_s"] for e in history) / n
+        avg_rtf = sum(e["rtf"] for e in history) / n
+        last = history[-1]
+
+        lines = [
+            f"推理统计 (共 {n} 次):",
+            f"  平均延迟: {avg_latency:.2f}s | 平均 RTF: {avg_rtf:.2f}",
+            f"  最近一次: {last['latency_s']:.2f}s | RTF {last['rtf']:.2f} | "
+            f"文本 {last['text_len']} 字 | 音频 {last['audio_len_s']:.1f}s",
+        ]
+        return "\n".join(lines)
+
+
+def _check_quantization_status(model: Optional[Any] = None) -> str:
+    """Detect if model contains quantized layers and return status string."""
+    if model is None:
+        return "量化状态: 模型未加载"
+
+    # Check for quantize_config.json in model directory
+    total_linear = 0
+    quantized_count = 0
+    quant_types = set()
+
+    inner_model = getattr(model, "model", model)
+    talker = getattr(inner_model, "talker", inner_model)
+
+    for m in talker.modules():
+        cls_name = type(m).__name__
+        if isinstance(m, torch.nn.Linear):
+            total_linear += 1
+        elif any(kw in cls_name.lower() for kw in ("int4", "int8", "quant", "affine", "dynamic")):
+            quantized_count += 1
+            quant_types.add(cls_name)
+
+    if quantized_count > 0:
+        types_str = ", ".join(sorted(quant_types))
+        return f"量化状态: {quantized_count} 层已量化 (类型: {types_str})"
+    elif total_linear > 0:
+        return f"量化状态: FP16/FP32 (未量化, {total_linear} Linear 层)"
+    else:
+        return "量化状态: 无法检测"
+
+
+# Global monitor and tracker instances
+_jetson_monitor: Optional[JetsonMonitor] = None
+_inference_tracker: Optional[InferenceTracker] = None
+
+
+def _get_monitor() -> JetsonMonitor:
+    global _jetson_monitor
+    if _jetson_monitor is None:
+        _jetson_monitor = JetsonMonitor()
+        _jetson_monitor.start()
+    return _jetson_monitor
+
+
+def _get_tracker() -> InferenceTracker:
+    global _inference_tracker
+    if _inference_tracker is None:
+        _inference_tracker = InferenceTracker()
+    return _inference_tracker
 
 
 def _cuda_brief_info() -> str:
@@ -376,7 +622,7 @@ def _save_wav(wav: np.ndarray, sr: int, output_dir: str, prefix: str) -> str:
     return out_path
 
 
-def _system_check_summary(checkpoint: str, output_dir: str) -> str:
+def _system_check_summary(checkpoint: str, output_dir: str, model: Any = None) -> str:
     meminfo = _read_meminfo()
     mem_total = meminfo.get("MemTotal")
     mem_avail = meminfo.get("MemAvailable")
@@ -384,21 +630,21 @@ def _system_check_summary(checkpoint: str, output_dir: str) -> str:
 
     swap = _check_swap()
     cuda = _check_cuda_mem()
-    model = _check_model_downloaded(checkpoint)
+    model_status = _check_model_downloaded(checkpoint)
 
     lines = []
-    lines.append(f"模型检查: {model.get('status')}")
-    if model.get("status") in {"local_dir", "local_dir_invalid", "cached_invalid"}:
-        lines.append(f"- 路径: {model.get('path')}")
-        lines.append(f"- config.json: {model.get('has_config')}")
-        lines.append(f"- 权重文件: {model.get('has_weights')}")
-        if model.get("error"):
-            lines.append(f"- 错误: {model.get('error')}")
-    elif model.get("status") in {"local_file", "cached"}:
-        lines.append(f"- 路径: {model.get('path')}")
-        if model.get("error"):
-            lines.append(f"- 错误: {model.get('error')}")
-    elif model.get("status") == "not_cached":
+    lines.append(f"模型检查: {model_status.get('status')}")
+    if model_status.get("status") in {"local_dir", "local_dir_invalid", "cached_invalid"}:
+        lines.append(f"- 路径: {model_status.get('path')}")
+        lines.append(f"- config.json: {model_status.get('has_config')}")
+        lines.append(f"- 权重文件: {model_status.get('has_weights')}")
+        if model_status.get("error"):
+            lines.append(f"- 错误: {model_status.get('error')}")
+    elif model_status.get("status") in {"local_file", "cached"}:
+        lines.append(f"- 路径: {model_status.get('path')}")
+        if model_status.get("error"):
+            lines.append(f"- 错误: {model_status.get('error')}")
+    elif model_status.get("status") == "not_cached":
         lines.append("- 未在本地缓存检测到模型，可提前离线下载")
 
     lines.append(f"内存: { _format_bytes(mem_used) } / { _format_bytes(mem_total) } (used/total)")
@@ -411,6 +657,25 @@ def _system_check_summary(checkpoint: str, output_dir: str) -> str:
             f"CUDA 显存: { _format_bytes(cuda['used']) } / { _format_bytes(cuda['total']) }"
         )
     lines.append(f"输出目录: {output_dir}")
+
+    # Jetson monitor data
+    monitor = _get_monitor()
+    mon_summary = monitor.format_summary()
+    if "等待数据" not in mon_summary and "无数据" not in mon_summary:
+        lines.append("")
+        lines.append(mon_summary)
+
+    # Quantization status
+    lines.append("")
+    lines.append(_check_quantization_status(model))
+
+    # Inference stats
+    tracker = _get_tracker()
+    tracker_summary = tracker.format_summary()
+    if "暂无数据" not in tracker_summary:
+        lines.append("")
+        lines.append(tracker_summary)
+
     return "\n".join(lines)
 
 
@@ -707,16 +972,22 @@ def _build_voice_design_ui(tts: Qwen3TTSModel, output_dir: str, save_audio: bool
                 _coerce_float(top_p_in, 0.9),
                 _coerce_float(repetition_penalty_in, 1.05),
             )
+            t0 = time.time()
             wavs, sr = tts.generate_voice_design(
                 text=text_in,
                 language=_maybe_auto_language(lang_in),
                 instruct=instruct_in,
                 **gen_kwargs,
             )
+            latency = time.time() - t0
+            audio_len = len(wavs[0]) / sr if sr > 0 else 0
+            _get_tracker().record(latency, len(text_in), audio_len)
+
             saved_path = ""
             if save_audio:
                 saved_path = _save_wav(wavs[0], sr, output_dir, "design")
-            status_msg = f"OK{f' | Saved: {saved_path}' if saved_path else ''}"
+            rtf = latency / audio_len if audio_len > 0 else 0
+            status_msg = f"OK | {latency:.2f}s | RTF {rtf:.2f}{f' | Saved: {saved_path}' if saved_path else ''}"
             return (sr, wavs[0]), status_msg
 
         gen_btn.click(
@@ -907,14 +1178,47 @@ def build_demo(
         else:
             gr.Markdown(f"⚠️ 不支持的模型类型: {model_type}")
 
-        with gr.Accordion("系统状态", open=False):
-            sys_info = gr.Textbox(label="详细信息", lines=6, value=_system_check_summary(checkpoint, output_dir))
-            refresh_btn = gr.Button("刷新")
+        with gr.Accordion("系统监控 (System Monitor)", open=False):
+            with gr.Row():
+                with gr.Column(scale=2):
+                    sys_info = gr.Textbox(
+                        label="系统状态",
+                        lines=10,
+                        value=_system_check_summary(checkpoint, output_dir, model=tts),
+                    )
+                with gr.Column(scale=1):
+                    quant_info = gr.Textbox(
+                        label="量化 & 推理",
+                        lines=10,
+                        value=_check_quantization_status(tts) + "\n\n" + _get_tracker().format_summary(),
+                    )
+            with gr.Row():
+                auto_refresh_cb = gr.Checkbox(label="自动刷新", value=False)
+                refresh_btn = gr.Button("手动刷新")
 
-            def _refresh() -> str:
-                return _system_check_summary(checkpoint, output_dir)
+            def _refresh() -> Tuple[str, str]:
+                sys_text = _system_check_summary(checkpoint, output_dir, model=tts)
+                quant_text = _check_quantization_status(tts) + "\n\n" + _get_tracker().format_summary()
+                return sys_text, quant_text
 
-            refresh_btn.click(_refresh, outputs=[sys_info])
+            refresh_btn.click(_refresh, outputs=[sys_info, quant_info])
+
+            # Auto-refresh via Timer if Gradio supports it
+            try:
+                timer = gr.Timer(value=5, active=False)
+
+                def _auto_tick() -> Tuple[str, str]:
+                    return _refresh()
+
+                timer.tick(_auto_tick, outputs=[sys_info, quant_info])
+
+                def _toggle_timer(enabled: bool):
+                    return gr.Timer(active=enabled)
+
+                auto_refresh_cb.change(_toggle_timer, inputs=[auto_refresh_cb], outputs=[timer])
+            except (AttributeError, TypeError):
+                # Gradio version doesn't support Timer
+                pass
 
         gr.Markdown("---")
         gr.Markdown(
@@ -1510,10 +1814,16 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                     design_audio_out = gr.Audio(label="生成结果", type="numpy", scale=3)
                     design_status = gr.Textbox(label="状态", lines=2, scale=1)
 
-            # 系统状态放在最后
-            with gr.Accordion("系统状态", open=False):
-                sys_info = gr.Textbox(label="详细信息", lines=6, value="")
-                refresh_btn = gr.Button("刷新")
+            # 系统监控面板
+            with gr.Accordion("系统监控 (System Monitor)", open=False):
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        sys_info = gr.Textbox(label="系统状态", lines=10, value="")
+                    with gr.Column(scale=1):
+                        quant_info = gr.Textbox(label="量化 & 推理", lines=10, value="")
+                with gr.Row():
+                    auto_refresh_cb = gr.Checkbox(label="自动刷新", value=False)
+                    refresh_btn = gr.Button("手动刷新")
 
         gr.Markdown("---")
         gr.Markdown(
@@ -1530,6 +1840,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 return (
                     "请先选择或输入模型路径",
                     gr.update(visible=False),
+                    "",
                     "",
                     gr.update(visible=False),
                     gr.update(visible=False),
@@ -1548,6 +1859,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                         return (
                             f"无效的模型路径: {checkpoint}\n缺少 config.json 或权重文件",
                             gr.update(visible=False),
+                            "",
                             "",
                             gr.update(visible=False),
                             gr.update(visible=False),
@@ -1596,13 +1908,16 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                     f"路径: {checkpoint}\n"
                     f"类型: {model_type} | device={args.device} | dtype={args.dtype}"
                 )
-                sys_check = _system_check_summary(checkpoint, output_dir)
+                sys_check = _system_check_summary(checkpoint, output_dir, model=tts)
+
+                quant_check = _check_quantization_status(tts) + "\n\n" + _get_tracker().format_summary()
 
                 # 返回 UI 更新
                 return (
                     status_msg,  # model_status_text
                     gr.update(visible=True),  # tts_area
                     sys_check,  # sys_info
+                    quant_check,  # quant_info
                     gr.update(visible=(model_type == "base")),  # base_tab
                     gr.update(visible=(model_type == "custom_voice")),  # custom_tab
                     gr.update(visible=(model_type == "voice_design")),  # design_tab
@@ -1616,6 +1931,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                     error_msg,
                     gr.update(visible=False),
                     "",
+                    "",
                     gr.update(visible=False),
                     gr.update(visible=False),
                     gr.update(visible=False),
@@ -1625,16 +1941,32 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
         load_btn.click(
             load_model_fn,
             inputs=[model_path_display, device_input, dtype_dropdown, flash_attn_checkbox, sanitize_logits_checkbox, staged_load_checkbox, tokenizer_cpu_checkbox],
-            outputs=[model_status_text, tts_area, sys_info, base_tab, custom_tab, design_tab, custom_speaker]
+            outputs=[model_status_text, tts_area, sys_info, quant_info, base_tab, custom_tab, design_tab, custom_speaker]
         )
 
         # 刷新系统检查
         def refresh_sys_check():
+            tts_obj = state.get("tts")
             if state["checkpoint"]:
-                return _system_check_summary(state["checkpoint"], output_dir)
-            return "模型未加载"
+                sys_text = _system_check_summary(state["checkpoint"], output_dir, model=tts_obj)
+            else:
+                sys_text = "模型未加载"
+            quant_text = _check_quantization_status(tts_obj) + "\n\n" + _get_tracker().format_summary()
+            return sys_text, quant_text
 
-        refresh_btn.click(refresh_sys_check, outputs=[sys_info])
+        refresh_btn.click(refresh_sys_check, outputs=[sys_info, quant_info])
+
+        # Auto-refresh via Timer if Gradio supports it
+        try:
+            lazy_timer = gr.Timer(value=5, active=False)
+            lazy_timer.tick(refresh_sys_check, outputs=[sys_info, quant_info])
+
+            def _toggle_lazy_timer(enabled: bool):
+                return gr.Timer(active=enabled)
+
+            auto_refresh_cb.change(_toggle_lazy_timer, inputs=[auto_refresh_cb], outputs=[lazy_timer])
+        except (AttributeError, TypeError):
+            pass
 
         # ===== TTS 生成函数 =====
         def infer_base(text_in, lang_in, ref_audio_path, ref_text_in, xvec_only_in,
@@ -1732,16 +2064,22 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
             if logits_processor is not None:
                 gen_kwargs["logits_processor"] = logits_processor
                 gen_kwargs["subtalker_dosample"] = False
+            t0 = time.time()
             wavs, sr = state["tts"].generate_voice_design(
                 text=text_in,
                 language=_maybe_auto_language(lang_in),
                 instruct=instruct_in,
                 **gen_kwargs,
             )
+            latency = time.time() - t0
+            audio_len = len(wavs[0]) / sr if sr > 0 else 0
+            _get_tracker().record(latency, len(text_in), audio_len)
+
             saved_path = ""
             if save_audio:
                 saved_path = _save_wav(wavs[0], sr, output_dir, "design")
-            status_msg = f"OK{f' | Saved: {saved_path}' if saved_path else ''}"
+            rtf = latency / audio_len if audio_len > 0 else 0
+            status_msg = f"OK | {latency:.2f}s | RTF {rtf:.2f}{f' | Saved: {saved_path}' if saved_path else ''}"
             return (sr, wavs[0]), status_msg
 
         design_gen_btn.click(
@@ -1803,6 +2141,10 @@ def _load_trt_tts(args: argparse.Namespace) -> Qwen3TTSModel:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Initialize Jetson hardware monitor (background thread)
+    _get_monitor()
+    _get_tracker()
 
     launch_kwargs: Dict[str, Any] = dict(
         server_name=args.ip,

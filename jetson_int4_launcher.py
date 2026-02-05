@@ -3,18 +3,19 @@
 """
 Qwen3-TTS VoiceDesign INT4 launcher for Jetson Orin.
 
-Startup modes:
-1) Provide a custom quantization command (--quantize-cmd)
-2) Auto-detect existing INT4 engine
-3) If missing, run quantization script
-4) After quantization, launch Gradio automatically
+Simplified workflow:
+1. Check if quantized model exists (<model-dir>-INT4/quantize_config.json)
+2. If not, run quantize_int4.py to create it
+3. Launch jetson_gradio_app.py with the quantized model
+
+Usage:
+    python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -27,100 +28,47 @@ def _path(p: Optional[str]) -> Optional[Path]:
     return Path(p).expanduser().resolve()
 
 
-def _engine_ready(engine_path: Path) -> bool:
-    return engine_path.exists() and engine_path.is_file()
-
-
-def _run_cmd(cmd: List[str], shell: bool = False) -> None:
-    print(f"[Run] {' '.join(cmd) if not shell else cmd}")
-    if shell:
-        result = subprocess.run(cmd, shell=True)
-    else:
-        result = subprocess.run(cmd)
+def _run(cmd: List[str], desc: str) -> None:
+    """Run a command, printing it first."""
+    print(f"[{desc}] {' '.join(cmd)}")
+    result = subprocess.run(cmd)
     if result.returncode != 0:
-        raise RuntimeError(f"Command failed with exit code {result.returncode}")
+        raise RuntimeError(f"{desc} failed with exit code {result.returncode}")
 
 
-def _build_quantize_cmd(args, model_dir: Path, int4_dir: Path) -> List[str]:
-    if args.quantize_cmd:
-        return [args.quantize_cmd]
-
-    script = _path(args.quantize_script)
-    if not script or not script.exists():
-        raise FileNotFoundError(
-            "Quantization script not found. Provide --quantize-script or use --quantize-cmd."
-        )
-
-    if not args.calib_dataset:
-        raise ValueError("Missing --calib-dataset for quantization.")
-
-    cmd = [
-        sys.executable,
-        str(script),
-        "--model_dir",
-        str(model_dir),
-        "--output_dir",
-        str(int4_dir),
-        "--calib_dataset",
-        str(_path(args.calib_dataset)),
-        "--dtype",
-        "int4",
-        "--max_batch_size",
-        str(args.max_batch_size),
-        "--max_input_len",
-        str(args.max_input_len),
-        "--max_output_len",
-        str(args.max_output_len),
-    ]
-
-    if args.extra_quantize_args:
-        cmd.extend(shlex.split(args.extra_quantize_args))
-
-    return cmd
-
-
-def _build_gradio_cmd(args, engine_path: Path, tokenizer_dir: Path) -> List[str]:
-    cmd = [
-        sys.executable,
-        str(_path(args.gradio_script) or "jetson_gradio_app.py"),
-        "--backend",
-        "trt",
-        "--engine-path",
-        str(engine_path),
-        "--tokenizer-dir",
-        str(tokenizer_dir),
-        "--model-type",
-        "voice_design",
-    ]
-
-    if args.gradio_args:
-        cmd.extend(shlex.split(args.gradio_args))
-
-    return cmd
+def _quantized_ready(int4_dir: Path) -> bool:
+    """Check if a valid quantized model exists."""
+    config = int4_dir / "quantize_config.json"
+    weights = int4_dir / "quantized_model.pt"
+    return config.exists() and weights.exists()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="INT4 quantize + launch Gradio (VoiceDesign only).")
+    p = argparse.ArgumentParser(
+        description="INT4 quantize + launch Gradio (VoiceDesign).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Default: quantize 0.6B model and launch Gradio
+  python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign
+
+  # Skip quantization (use existing quantized model)
+  python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign --skip-quantize
+
+  # Force re-quantization
+  python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign --force-quantize
+
+  # Custom port
+  python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign --port 7860
+        """,
+    )
     p.add_argument("--model-dir", required=True, help="FP16 model directory.")
-    p.add_argument("--int4-dir", default=None, help="INT4 output directory (default: <model-dir>-int4).")
-    p.add_argument("--engine-path", default=None, help="TensorRT engine plan path.")
-    p.add_argument("--tokenizer-dir", default=None, help="Tokenizer directory (default: --model-dir).")
-
-    # Quantization controls
-    p.add_argument("--quantize-cmd", default=None, help="Custom quantization command (runs as shell).")
-    p.add_argument("--quantize-script", default=None, help="Quantization script path.")
-    p.add_argument("--calib-dataset", default=None, help="Calibration dataset jsonl.")
-    p.add_argument("--max-batch-size", type=int, default=4)
-    p.add_argument("--max-input-len", type=int, default=256)
-    p.add_argument("--max-output-len", type=int, default=1024)
-    p.add_argument("--extra-quantize-args", default=None, help="Extra args forwarded to quantize script.")
-    p.add_argument("--skip-quantize", action="store_true", help="Skip quantization step.")
+    p.add_argument("--int4-dir", default=None, help="INT4 output dir (default: <model-dir>-INT4).")
+    p.add_argument("--skip-quantize", action="store_true", help="Skip quantization, use FP16 model directly.")
     p.add_argument("--force-quantize", action="store_true", help="Force re-quantization.")
-
-    # Gradio launch
-    p.add_argument("--gradio-script", default="jetson_gradio_app.py", help="Gradio app entrypoint.")
-    p.add_argument("--gradio-args", default=None, help="Extra args for Gradio app.")
-    p.add_argument("--dry-run", action="store_true", help="Print commands without running.")
+    p.add_argument("--port", type=int, default=8000, help="Gradio server port (default: 8000).")
+    p.add_argument("--ip", default="0.0.0.0", help="Gradio bind IP (default: 0.0.0.0).")
+    p.add_argument("--dry-run", action="store_true", help="Print commands without executing.")
     return p
 
 
@@ -129,42 +77,73 @@ def main(argv=None) -> int:
 
     model_dir = _path(args.model_dir)
     if not model_dir or not model_dir.exists():
-        raise FileNotFoundError(f"Model dir not found: {args.model_dir}")
+        print(f"[Error] Model directory not found: {args.model_dir}")
+        return 1
 
-    int4_dir = _path(args.int4_dir) or Path(str(model_dir) + "-int4")
-    engine_path = _path(args.engine_path) or (int4_dir / "trt_engine.plan")
-    tokenizer_dir = _path(args.tokenizer_dir) or model_dir
+    int4_dir = _path(args.int4_dir) or Path(str(model_dir) + "-INT4")
 
-    ready = _engine_ready(engine_path)
-    if args.force_quantize:
-        ready = False
+    # Determine the script directory (for finding quantize_int4.py and gradio app)
+    script_dir = Path(__file__).resolve().parent
+    quantize_script = script_dir / "quantize_int4.py"
+    gradio_script = script_dir / "jetson_gradio_app.py"
 
+    # Step 1: Quantization
     if args.skip_quantize:
-        print("[Skip] Quantization step skipped.")
-    elif not ready:
-        print("[Quantize] INT4 engine not found. Starting quantization...")
-        int4_dir.mkdir(parents=True, exist_ok=True)
-        cmd = _build_quantize_cmd(args, model_dir, int4_dir)
-        if args.dry_run:
-            print(f"[Dry-Run] Quantize command: {cmd}")
-        else:
-            if args.quantize_cmd:
-                _run_cmd(cmd[0], shell=True)
-            else:
-                _run_cmd(cmd, shell=False)
-
-        if not _engine_ready(engine_path):
-            raise RuntimeError(f"Quantization finished but engine not found: {engine_path}")
+        print("[Skip] Quantization skipped. Using FP16 model directly.")
+        checkpoint = str(model_dir)
+    elif _quantized_ready(int4_dir) and not args.force_quantize:
+        print(f"[OK] Quantized model found: {int4_dir}")
+        checkpoint = str(model_dir)  # Gradio app loads FP16 structure; INT4 dir for reference
     else:
-        print(f"[OK] INT4 engine found: {engine_path}")
+        if not quantize_script.exists():
+            print(f"[Error] quantize_int4.py not found at {quantize_script}")
+            return 1
 
-    gradio_cmd = _build_gradio_cmd(args, engine_path, tokenizer_dir)
+        print("[Quantize] Starting INT4 quantization...")
+        quant_cmd = [
+            sys.executable,
+            str(quantize_script),
+            "--model-dir", str(model_dir),
+            "--output-dir", str(int4_dir),
+            "--verify",
+        ]
+        if args.force_quantize:
+            quant_cmd.append("--force")
+
+        if args.dry_run:
+            print(f"[Dry-Run] {' '.join(quant_cmd)}")
+        else:
+            _run(quant_cmd, "Quantize")
+            if not _quantized_ready(int4_dir):
+                print(f"[Error] Quantization finished but output not found: {int4_dir}")
+                return 1
+
+        checkpoint = str(model_dir)
+
+    # Step 2: Launch Gradio
+    gradio_cmd = [
+        sys.executable,
+        str(gradio_script),
+        checkpoint,
+        "--device", "cuda",
+        "--dtype", "float16",
+        "--port", str(args.port),
+        "--ip", args.ip,
+        "--no-flash-attn",
+        "--staged-load",
+        "--tokenizer-on-cpu",
+    ]
+
     if args.dry_run:
-        print(f"[Dry-Run] Gradio command: {gradio_cmd}")
+        print(f"[Dry-Run] {' '.join(gradio_cmd)}")
         return 0
 
-    print("[Launch] Starting Gradio...")
-    _run_cmd(gradio_cmd, shell=False)
+    print("\n[Launch] Starting Gradio app...")
+    print(f"[Launch] Model: {checkpoint}")
+    print(f"[Launch] INT4:  {int4_dir}")
+    print(f"[Launch] URL:   http://{args.ip}:{args.port}")
+
+    _run(gradio_cmd, "Gradio")
     return 0
 
 
