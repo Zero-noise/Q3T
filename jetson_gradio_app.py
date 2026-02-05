@@ -16,6 +16,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import gc
+
 import gradio as gr
 import numpy as np
 import torch
@@ -199,6 +201,9 @@ SUPPORTED_MODELS = [
     "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
     "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
     "Qwen/Qwen3-TTS-12Hz-0.6B-VoiceDesign",
+    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
     "Qwen/Qwen3-TTS-25Hz-0.6B-Base",
     "Qwen/Qwen3-TTS-25Hz-0.6B-CustomVoice",
     "Qwen/Qwen3-TTS-25Hz-0.6B-VoiceDesign",
@@ -407,6 +412,7 @@ def _system_check_summary(checkpoint: str, output_dir: str) -> str:
         lines.append(
             f"CUDA 显存: { _format_bytes(cuda['used']) } / { _format_bytes(cuda['total']) }"
         )
+    lines.append(f"bitsandbytes: {'可用' if _check_bnb_available() else '未安装'}")
     lines.append(f"输出目录: {output_dir}")
     return "\n".join(lines)
 
@@ -420,6 +426,43 @@ def _dtype_from_str(s: str) -> torch.dtype:
     if s in ("fp32", "float32"):
         return torch.float32
     raise ValueError(f"Unsupported torch dtype: {s}. Use bfloat16/float16/float32.")
+
+
+def _check_bnb_available() -> bool:
+    try:
+        import bitsandbytes  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _build_bnb_config(quantize_mode: str):
+    """Build BitsAndBytesConfig for INT4 or INT8 quantization."""
+    if quantize_mode not in ("int4", "int8"):
+        return None
+    if not _check_bnb_available():
+        print(f"[Warn] bitsandbytes not installed, cannot use {quantize_mode} quantization. Falling back to FP16.")
+        return None
+    from transformers import BitsAndBytesConfig
+    if quantize_mode == "int4":
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+    else:
+        return BitsAndBytesConfig(
+            load_in_8bit=True,
+        )
+
+
+def _aggressive_gc():
+    """Aggressively free unused memory on both CPU and GPU."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 def _maybe_auto_language(lang: str) -> str:
@@ -456,19 +499,47 @@ def _load_tts(args: argparse.Namespace) -> Qwen3TTSModel:
             except Exception:
                 pass
         device_map = "cuda"
+
+    quantize_mode = getattr(args, "quantize", "none") or "none"
+    use_compile = bool(getattr(args, "compile_model", False))
+
     print(f"[Load] device_map={device_map} (from '{args.device}') | dtype={dtype} | flash_attn={'on' if attn_impl else 'off'}")
+    print(f"[Load] quantize={quantize_mode} | compile={use_compile}")
     print(f"[Load] { _cuda_brief_info() }")
 
-    # 在加载前清理 GPU 缓存
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        import gc
-        gc.collect()
+    _aggressive_gc()
 
     use_staged = bool(getattr(args, "staged_load", False))
     tokenizer_on_cpu = bool(getattr(args, "tokenizer_on_cpu", False))
     print(f"[Load] staged_load={'on' if use_staged else 'off'} | tokenizer_on_cpu={'on' if tokenizer_on_cpu else 'off'}")
 
+    # --- INT4 / INT8 quantization path (via bitsandbytes) ---
+    bnb_config = _build_bnb_config(quantize_mode)
+    if bnb_config is not None:
+        print(f"[Load] Using bitsandbytes {quantize_mode} quantization (NF4 double-quant)" if quantize_mode == "int4"
+              else f"[Load] Using bitsandbytes {quantize_mode} quantization")
+        tts = Qwen3TTSModel.from_pretrained(
+            args.checkpoint,
+            device_map="auto",
+            torch_dtype=dtype,
+            attn_implementation=attn_impl,
+            low_cpu_mem_usage=True,
+            quantization_config=bnb_config,
+        )
+        _aggressive_gc()
+        # Speech tokenizer should remain in full precision for audio quality
+        if hasattr(tts.model, "speech_tokenizer"):
+            st = getattr(tts.model, "speech_tokenizer", None)
+            if tokenizer_on_cpu:
+                _move_speech_tokenizer(st, "cpu", torch.float32)
+            else:
+                _move_speech_tokenizer(st, "cuda", dtype)
+        if use_compile:
+            tts = _try_compile_model(tts)
+        _aggressive_gc()
+        return tts
+
+    # --- Staged loading path (CPU -> dtype cast -> GPU) ---
     if use_staged and device_map == "cuda":
         print("[Load] staged_load path: CPU -> dtype -> GPU")
         tts = Qwen3TTSModel.from_pretrained(
@@ -480,6 +551,7 @@ def _load_tts(args: argparse.Namespace) -> Qwen3TTSModel:
         )
         if dtype in (torch.float16, torch.bfloat16):
             tts.model = tts.model.to(dtype=dtype)
+        _aggressive_gc()
         tts.model = tts.model.to("cuda")
         tts.device = torch.device("cuda")
         if hasattr(tts.model, "device"):
@@ -490,19 +562,40 @@ def _load_tts(args: argparse.Namespace) -> Qwen3TTSModel:
                 _move_speech_tokenizer(st, "cpu", dtype)
             else:
                 _move_speech_tokenizer(st, "cuda", dtype)
+        if use_compile:
+            tts = _try_compile_model(tts)
+        _aggressive_gc()
         return tts
 
+    # --- Standard loading path ---
     tts = Qwen3TTSModel.from_pretrained(
         args.checkpoint,
         device_map=device_map,
         torch_dtype=dtype,
         attn_implementation=attn_impl,
-        low_cpu_mem_usage=True,  # 减少加载时的内存峰值
+        low_cpu_mem_usage=True,
     )
     if hasattr(tts.model, "speech_tokenizer"):
         st = getattr(tts.model, "speech_tokenizer", None)
         if tokenizer_on_cpu:
             _move_speech_tokenizer(st, "cpu", dtype)
+    if use_compile:
+        tts = _try_compile_model(tts)
+    _aggressive_gc()
+    return tts
+
+
+def _try_compile_model(tts: Qwen3TTSModel) -> Qwen3TTSModel:
+    """Optionally torch.compile the talker for faster generation on supported platforms."""
+    try:
+        if hasattr(tts.model, "talker"):
+            print("[Compile] Compiling talker with torch.compile (reduce-overhead)...")
+            tts.model.talker = torch.compile(tts.model.talker, mode="reduce-overhead")
+            print("[Compile] Done.")
+        else:
+            print("[Compile] No talker sub-model found, skipping.")
+    except Exception as e:
+        print(f"[Compile] torch.compile failed (non-fatal): {e}")
     return tts
 
 
@@ -968,6 +1061,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Move speech tokenizer to GPU.",
     )
+    parser.add_argument(
+        "--quantize",
+        default="none",
+        choices=["none", "int4", "int8"],
+        help="Quantization mode via bitsandbytes (default: none). "
+             "int4 uses NF4 double-quant (~2.5GB for 0.6B, ~5GB for 1.7B). "
+             "int8 uses LLM.int8() (~3.5GB for 0.6B, ~7GB for 1.7B).",
+    )
+    parser.add_argument(
+        "--compile",
+        dest="compile_model",
+        action="store_true",
+        default=False,
+        help="Use torch.compile on the talker model for faster generation.",
+    )
     parser.add_argument("--ip", default="0.0.0.0", help="Gradio server bind IP.")
     parser.add_argument("--port", type=int, default=8000, help="Gradio server port.")
     parser.add_argument("--share", action="store_true", help="Create a public Gradio link.")
@@ -1212,6 +1320,12 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                             choices=["float16", "bfloat16", "float32"],
                             value="float16" if args.dtype in ["fp16", "float16"] else args.dtype,
                         )
+                        quantize_dropdown = gr.Dropdown(
+                            label="量化 (Quantize)",
+                            choices=["none", "int4", "int8"],
+                            value=getattr(args, "quantize", "none") or "none",
+                            info="INT4: ~60% 省内存, INT8: ~50% 省内存",
+                        )
 
                         with gr.Row():
                             flash_attn_checkbox = gr.Checkbox(
@@ -1232,6 +1346,10 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                                 label="Tok CPU",
                                 value=bool(args.tokenizer_on_cpu),
                             )
+                        compile_checkbox = gr.Checkbox(
+                            label="Compile (torch.compile 加速)",
+                            value=bool(getattr(args, "compile_model", False)),
+                        )
 
             # 加载按钮
             load_btn = gr.Button("🚀 加载模型", variant="primary", size="lg")
@@ -1490,7 +1608,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
         )
 
         # ===== 加载模型逻辑 =====
-        def load_model_fn(model_path: str, device_in: str, dtype_in: str, flash_attn_in: bool, sanitize_logits_in: bool, staged_load_in: bool, tokenizer_cpu_in: bool):
+        def load_model_fn(model_path: str, device_in: str, dtype_in: str, quantize_in: str, flash_attn_in: bool, sanitize_logits_in: bool, staged_load_in: bool, tokenizer_cpu_in: bool, compile_in: bool):
             nonlocal state
 
             if not model_path or not model_path.strip():
@@ -1522,16 +1640,29 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                             gr.update(choices=[], value=None),
                         )
 
+                # Free previously loaded model
+                if state["tts"] is not None:
+                    del state["tts"]
+                    state["tts"] = None
+                    _aggressive_gc()
+
                 # 应用加载参数
                 args.device = (device_in or "").strip() or args.device
                 args.dtype = (dtype_in or "").strip() or args.dtype
+                args.quantize = (quantize_in or "").strip() or "none"
                 args.no_flash_attn = not bool(flash_attn_in)
                 args.staged_load = bool(staged_load_in)
                 args.tokenizer_on_cpu = bool(tokenizer_cpu_in)
+                args.compile_model = bool(compile_in)
 
                 if args.device.lower().startswith("cpu") and args.dtype.lower() in ("bfloat16", "bf16", "float16", "fp16"):
                     print("[Info] CPU 模式下将 dtype 自动切换为 float32，以避免 NaN/Inf。")
                     args.dtype = "float32"
+
+                # INT4/INT8 quantization requires CUDA
+                if args.quantize in ("int4", "int8") and not args.device.lower().startswith("cuda") and args.device.lower() != "auto":
+                    print(f"[Info] {args.quantize} 量化需要 CUDA，自动切换 device 为 auto。")
+                    args.device = "auto"
 
                 state["sanitize_logits"] = bool(sanitize_logits_in)
 
@@ -1558,10 +1689,12 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 if model_type == "custom_voice":
                     speakers = tts.model.get_supported_speakers() or []
 
+                quant_label = f" | quantize={args.quantize}" if args.quantize != "none" else ""
+                compile_label = " | compiled" if args.compile_model else ""
                 status_msg = (
                     f"✅ 模型加载成功!\n"
                     f"路径: {checkpoint}\n"
-                    f"类型: {model_type} | device={args.device} | dtype={args.dtype}"
+                    f"类型: {model_type} | device={args.device} | dtype={args.dtype}{quant_label}{compile_label}"
                 )
                 sys_check = _system_check_summary(checkpoint, output_dir)
 
@@ -1591,7 +1724,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
         load_btn.click(
             load_model_fn,
-            inputs=[model_path_display, device_input, dtype_dropdown, flash_attn_checkbox, sanitize_logits_checkbox, staged_load_checkbox, tokenizer_cpu_checkbox],
+            inputs=[model_path_display, device_input, dtype_dropdown, quantize_dropdown, flash_attn_checkbox, sanitize_logits_checkbox, staged_load_checkbox, tokenizer_cpu_checkbox, compile_checkbox],
             outputs=[model_status_text, tts_area, sys_info, base_tab, custom_tab, design_tab, custom_speaker]
         )
 
@@ -1613,6 +1746,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
             if not xvec_only_in and not (ref_text_in or "").strip():
                 return None, "ICL 模式需要参考文本"
 
+            _aggressive_gc()
             gen_kwargs = _collect_gen_kwargs(
                 _coerce_int(max_new_tokens_in, 1024),
                 _coerce_float(temperature_in, 0.8),
@@ -1632,6 +1766,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 x_vector_only_mode=bool(xvec_only_in),
                 **gen_kwargs,
             )
+            _aggressive_gc()
             saved_path = ""
             if save_audio:
                 saved_path = _save_wav(wavs[0], sr, output_dir, "base")
@@ -1652,6 +1787,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
             if not speaker_in:
                 return None, "请选择 speaker"
 
+            _aggressive_gc()
             gen_kwargs = _collect_gen_kwargs(
                 _coerce_int(max_new_tokens_in, 1024),
                 _coerce_float(temperature_in, 0.8),
@@ -1670,6 +1806,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 instruct=instruct_in,
                 **gen_kwargs,
             )
+            _aggressive_gc()
             saved_path = ""
             if save_audio:
                 saved_path = _save_wav(wavs[0], sr, output_dir, "custom")
@@ -1688,6 +1825,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
             if state["tts"] is None:
                 return None, "请先加载模型"
 
+            _aggressive_gc()
             gen_kwargs = _collect_gen_kwargs(
                 _coerce_int(max_new_tokens_in, 1024),
                 _coerce_float(temperature_in, 0.8),
@@ -1705,6 +1843,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 instruct=instruct_in,
                 **gen_kwargs,
             )
+            _aggressive_gc()
             saved_path = ""
             if save_audio:
                 saved_path = _save_wav(wavs[0], sr, output_dir, "design")

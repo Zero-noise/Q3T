@@ -136,6 +136,16 @@ python3 -m pip install \
     "huggingface_hub>=0.20.0" \
     "einops>=0.7.0"
 
+# Install bitsandbytes for INT4/INT8 quantization
+echo ""
+echo "Installing bitsandbytes for quantization support..."
+python3 -m pip install bitsandbytes>=0.43.0 || {
+    echo "Warning: bitsandbytes installation failed."
+    echo "INT4/INT8 quantization will not be available."
+    echo "You may need to build from source for aarch64:"
+    echo "  pip install bitsandbytes --no-build-isolation"
+}
+
 # Install onnxruntime for Jetson (GPU version)
 echo ""
 echo "Installing onnxruntime-gpu for Jetson..."
