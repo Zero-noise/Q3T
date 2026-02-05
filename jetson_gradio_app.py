@@ -9,6 +9,7 @@ Supports Base / CustomVoice / VoiceDesign models based on the checkpoint.
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
 import sys
 import time
@@ -20,6 +21,8 @@ import gradio as gr
 import numpy as np
 import torch
 from transformers.generation.logits_process import LogitsProcessorList
+
+_STARTUP_CWD = Path.cwd().resolve()
 
 class _NanClampLogitsProcessor:
     def __call__(self, input_ids, scores):
@@ -63,7 +66,7 @@ def _get_default_download_root() -> Path:
     env_root = os.getenv("QWEN3_TTS_DOWNLOAD_DIR")
     if env_root:
         return Path(env_root).expanduser().resolve()
-    return Path.cwd().resolve()
+    return _STARTUP_CWD
 
 
 def _get_default_download_dir(repo_id: str) -> Path:
@@ -883,12 +886,18 @@ def build_download_ui() -> gr.Blocks:
     return demo
 
 
-def build_demo(tts: Qwen3TTSModel, checkpoint: str, output_dir: str, save_audio: bool) -> gr.Blocks:
+def build_demo(
+    tts: Qwen3TTSModel,
+    checkpoint: str,
+    output_dir: str,
+    save_audio: bool,
+    force_model_type: Optional[str] = None,
+) -> gr.Blocks:
     with gr.Blocks(title="Qwen3-TTS") as demo:
         gr.Markdown("# Qwen3-TTS Jetson Orin")
         gr.Markdown("文本转语音演示 | Text-to-Speech Demo")
 
-        model_type = getattr(tts.model, "tts_model_type", "")
+        model_type = (force_model_type or getattr(tts.model, "tts_model_type", "")).strip()
         if model_type == "base":
             _build_base_ui(tts, output_dir, save_audio)
         elif model_type == "custom_voice":
@@ -980,6 +989,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-detect",
         action="store_true",
         help="Auto-detect and use the first available cached model.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["torch", "trt"],
+        default="torch",
+        help="Inference backend. Use 'trt' for TensorRT-LLM INT4 engine.",
+    )
+    parser.add_argument(
+        "--engine-path",
+        default=None,
+        help="TensorRT-LLM engine path (required when --backend trt).",
+    )
+    parser.add_argument(
+        "--tokenizer-dir",
+        default=None,
+        help="Tokenizer directory (required when --backend trt).",
+    )
+    parser.add_argument(
+        "--model-type",
+        choices=["voice_design"],
+        default=None,
+        help="Force model type when backend doesn't expose it.",
     )
     return parser
 
@@ -1098,6 +1129,8 @@ def _get_all_model_locations() -> List[str]:
 
 def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
     """构建延迟加载模型的界面 - 先启动UI，后加载模型"""
+    if args.backend != "torch":
+        raise ValueError("Lazy demo only supports --backend torch.")
     # 使用可变容器存储模型状态
     state = {"tts": None, "checkpoint": None, "model_type": None, "sanitize_logits": True}
     output_dir = _ensure_output_dir(args.output_dir)
@@ -1734,6 +1767,38 @@ def _get_local_ip() -> str:
     except Exception:
         return "127.0.0.1"
 
+def _load_trt_tts(args: argparse.Namespace) -> Qwen3TTSModel:
+    engine_path = (args.engine_path or "").strip()
+    tokenizer_dir = (args.tokenizer_dir or "").strip()
+    if not engine_path:
+        raise ValueError("--engine-path is required when --backend trt")
+    if not tokenizer_dir:
+        raise ValueError("--tokenizer-dir is required when --backend trt")
+
+    module_name = os.getenv("TRT_QWEN_TTS_MODULE", "trt_qwen_tts")
+    try:
+        mod = importlib.import_module(module_name)
+    except Exception as e:
+        raise ImportError(
+            f"Failed to import TRT backend module '{module_name}'. "
+            "Set TRT_QWEN_TTS_MODULE to your module or ensure trt_qwen_tts.py is available."
+        ) from e
+
+    if not hasattr(mod, "TRTQwen3TTSModel"):
+        raise ImportError(f"Module '{module_name}' does not expose TRTQwen3TTSModel")
+
+    cls = getattr(mod, "TRTQwen3TTSModel")
+    tts = cls.from_engine(engine_path=engine_path, tokenizer_dir=tokenizer_dir)
+
+    # Ensure model_type is visible to UI
+    if not hasattr(tts, "model"):
+        from types import SimpleNamespace
+        tts.model = SimpleNamespace(tts_model_type="voice_design")
+    else:
+        if not getattr(tts.model, "tts_model_type", None):
+            setattr(tts.model, "tts_model_type", "voice_design")
+    return tts
+
 
 def main(argv=None) -> int:
     parser = build_parser()
@@ -1788,9 +1853,21 @@ def main(argv=None) -> int:
     # tts = _load_tts(args)
     # demo = build_demo(tts, checkpoint, output_dir, save_audio=not args.no_save)
 
-    print("启动 Qwen3-TTS Gradio 界面...")
-    print("模型将在界面中选择后加载。")
-    demo = build_lazy_demo(args)
+    if args.backend == "trt":
+        print("启动 Qwen3-TTS Gradio 界面 (TRT backend)...")
+        output_dir = _ensure_output_dir(args.output_dir)
+        tts = _load_trt_tts(args)
+        demo = build_demo(
+            tts,
+            checkpoint=args.engine_path or "",
+            output_dir=output_dir,
+            save_audio=not args.no_save,
+            force_model_type=args.model_type or "voice_design",
+        )
+    else:
+        print("启动 Qwen3-TTS Gradio 界面...")
+        print("模型将在界面中选择后加载。")
+        demo = build_lazy_demo(args)
 
     # 获取并显示访问地址
     local_ip = _get_local_ip()
