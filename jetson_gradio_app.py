@@ -26,6 +26,10 @@ import numpy as np
 import torch
 from transformers.generation.logits_process import LogitsProcessorList
 
+from log_config import get_logger, setup_logging
+
+logger = get_logger(__name__)
+
 _STARTUP_CWD = Path.cwd().resolve()
 
 class _NanClampLogitsProcessor:
@@ -188,7 +192,7 @@ class JetsonMonitor:
             try:
                 self._process.terminate()
             except Exception:
-                pass
+                logger.debug("Failed to terminate tegrastats process", exc_info=True)
 
     def _poll_loop(self) -> None:
         """Try tegrastats first, fall back to sysfs readings."""
@@ -414,6 +418,7 @@ def _cuda_brief_info() -> str:
         idx = torch.cuda.current_device()
         name = torch.cuda.get_device_name(idx)
     except Exception:
+        logger.debug("Failed to query CUDA device info", exc_info=True)
         idx = "unknown"
         name = "unknown"
     return f"CUDA available: True | current_device={idx} | name={name}"
@@ -424,6 +429,7 @@ def _infer_model_device(model: torch.nn.Module) -> str:
         p = next(model.parameters())
         return str(p.device)
     except Exception:
+        logger.debug("Cannot infer device from parameters, falling back to attr", exc_info=True)
         dev = getattr(model, "device", None)
         return str(dev) if dev is not None else "unknown"
 
@@ -569,7 +575,7 @@ def _check_model_downloaded(checkpoint: str) -> Dict[str, Any]:
             "error": "缓存模型缺少 config.json 或权重文件",
         }
     except Exception:
-        pass
+        logger.debug("huggingface_hub local cache lookup failed for '%s'", checkpoint, exc_info=True)
 
     # 3. 检查当前目录下的默认下载位置
     try:
@@ -585,7 +591,7 @@ def _check_model_downloaded(checkpoint: str) -> Dict[str, Any]:
                 "error": "模型目录缺少 config.json 或权重文件" if status == "local_dir_invalid" else None,
             }
     except Exception:
-        pass
+        logger.debug("Default download dir lookup failed for '%s'", checkpoint, exc_info=True)
 
     # 4. 手动搜索 HuggingFace 缓存目录
     found_path = _find_model_in_hf_cache(checkpoint)
@@ -610,6 +616,7 @@ def _save_wav(wav: np.ndarray, sr: int, output_dir: str, prefix: str) -> str:
 
         sf.write(out_path, wav, sr)
     except Exception:
+        logger.debug("soundfile unavailable, falling back to scipy.io.wavfile", exc_info=True)
         try:
             from scipy.io import wavfile
 
@@ -617,6 +624,7 @@ def _save_wav(wav: np.ndarray, sr: int, output_dir: str, prefix: str) -> str:
             wav_int16 = (wav_int16 * 32767.0).astype(np.int16)
             wavfile.write(out_path, sr, wav_int16)
         except Exception as e:
+            logger.error("Failed to save audio to %s: %s", out_path, e, exc_info=True)
             raise RuntimeError(f"Failed to save audio: {e}") from e
     return out_path
 
@@ -721,10 +729,11 @@ def _load_tts(args: argparse.Namespace) -> Qwen3TTSModel:
             try:
                 torch.cuda.set_device(int(parts[1]))
             except Exception:
-                pass
+                logger.warning("Failed to set CUDA device %s", parts[1], exc_info=True)
         device_map = "cuda"
-    print(f"[Load] device_map={device_map} (from '{args.device}') | dtype={dtype} | flash_attn={'on' if attn_impl else 'off'}")
-    print(f"[Load] { _cuda_brief_info() }")
+    logger.info("device_map=%s (from '%s') | dtype=%s | flash_attn=%s",
+                device_map, args.device, dtype, "on" if attn_impl else "off")
+    logger.info("%s", _cuda_brief_info())
 
     # 在加载前清理 GPU 缓存
     if torch.cuda.is_available():
@@ -734,10 +743,11 @@ def _load_tts(args: argparse.Namespace) -> Qwen3TTSModel:
 
     use_staged = bool(getattr(args, "staged_load", False))
     tokenizer_on_cpu = bool(getattr(args, "tokenizer_on_cpu", False))
-    print(f"[Load] staged_load={'on' if use_staged else 'off'} | tokenizer_on_cpu={'on' if tokenizer_on_cpu else 'off'}")
+    logger.info("staged_load=%s | tokenizer_on_cpu=%s",
+                "on" if use_staged else "off", "on" if tokenizer_on_cpu else "off")
 
     if use_staged and device_map == "cuda":
-        print("[Load] staged_load path: CPU -> dtype -> GPU")
+        logger.info("staged_load path: CPU -> dtype -> GPU")
         tts = Qwen3TTSModel.from_pretrained(
             args.checkpoint,
             device_map="cpu",
@@ -1059,6 +1069,7 @@ def _download_model(repo_id: str, local_dir: Optional[str], progress=gr.Progress
         progress(1.0, desc="下载完成!")
         return f"下载成功!\n模型路径: {result_path}\n\n请重启应用并使用以下命令:\npython jetson_gradio_app.py {result_path}"
     except Exception as e:
+        logger.error("Model download failed for %s: %s", repo_id, e, exc_info=True)
         return f"下载失败: {str(e)}"
 
 
@@ -1216,8 +1227,7 @@ def build_demo(
 
                 auto_refresh_cb.change(_toggle_timer, inputs=[auto_refresh_cb], outputs=[timer])
             except (AttributeError, TypeError):
-                # Gradio version doesn't support Timer
-                pass
+                logger.debug("Gradio Timer not supported in this version, auto-refresh disabled")
 
         gr.Markdown("---")
         gr.Markdown(
@@ -1366,7 +1376,7 @@ def _scan_models_in_directory(directory: str) -> List[Dict[str, Any]]:
                         "type": _detect_model_type(sub),
                     })
     except (PermissionError, OSError):
-        pass
+        logger.debug("Cannot scan model directory %s", dir_path, exc_info=True)
 
     return found
 
@@ -1383,6 +1393,7 @@ def _detect_model_type(model_dir: Path) -> str:
             config = json.load(f)
         return config.get("tts_model_type", "unknown")
     except Exception:
+        logger.debug("Failed to detect model type from %s", config_path, exc_info=True)
         return "unknown"
 
 
@@ -1417,7 +1428,7 @@ def _get_all_model_locations() -> List[str]:
             if d.exists():
                 locations.append(str(d.resolve()))
         except (PermissionError, OSError):
-            pass
+            logger.debug("Cannot access model directory %s", d)
 
     # 去重并保持顺序
     seen = set()
@@ -1874,7 +1885,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 args.tokenizer_on_cpu = bool(tokenizer_cpu_in)
 
                 if args.device.lower().startswith("cpu") and args.dtype.lower() in ("bfloat16", "bf16", "float16", "fp16"):
-                    print("[Info] CPU 模式下将 dtype 自动切换为 float32，以避免 NaN/Inf。")
+                    logger.info("CPU 模式下将 dtype 自动切换为 float32，以避免 NaN/Inf")
                     args.dtype = "float32"
 
                 state["sanitize_logits"] = bool(sanitize_logits_in)
@@ -1883,15 +1894,15 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                 args.checkpoint = checkpoint
                 tts = _load_tts(args)
                 model_type = getattr(tts.model, "tts_model_type", "")
-                print(f"[Load] model_type={model_type} | model_device={_infer_model_device(tts.model)}")
+                logger.info("model_type=%s | model_device=%s", model_type, _infer_model_device(tts.model))
 
                 try:
                     st = getattr(tts.model, "speech_tokenizer", None)
                     st_model = getattr(st, "model", None) if st is not None else None
                     if st_model is not None:
-                        print(f"[Load] speech_tokenizer_device={_infer_model_device(st_model)}")
+                        logger.info("speech_tokenizer_device=%s", _infer_model_device(st_model))
                 except Exception:
-                    pass
+                    logger.debug("Failed to query speech_tokenizer device", exc_info=True)
 
                 state["tts"] = tts
                 state["checkpoint"] = checkpoint
@@ -1923,8 +1934,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                     gr.update(choices=speakers, value=speakers[0] if speakers else None),  # custom_speaker
                 )
             except Exception as e:
-                import traceback
-                traceback.print_exc()
+                logger.error("模型加载失败: %s", e, exc_info=True)
                 error_msg = f"❌ 模型加载失败: {str(e)}"
                 return (
                     error_msg,
@@ -1965,7 +1975,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
             auto_refresh_cb.change(_toggle_lazy_timer, inputs=[auto_refresh_cb], outputs=[lazy_timer])
         except (AttributeError, TypeError):
-            pass
+            logger.debug("Gradio Timer not supported in this version, auto-refresh disabled")
 
         # ===== TTS 生成函数 =====
         def infer_base(text_in, lang_in, ref_audio_path, ref_text_in, xvec_only_in,
@@ -2102,9 +2112,11 @@ def _get_local_ip() -> str:
         s.close()
         return ip
     except Exception:
+        logger.debug("Cannot detect LAN IP, falling back to 127.0.0.1", exc_info=True)
         return "127.0.0.1"
 
 def _load_trt_tts(args: argparse.Namespace) -> Qwen3TTSModel:
+    """Load TensorRT-LLM INT4 engine for Qwen3-TTS."""
     engine_path = (args.engine_path or "").strip()
     tokenizer_dir = (args.tokenizer_dir or "").strip()
     if not engine_path:
@@ -2113,19 +2125,29 @@ def _load_trt_tts(args: argparse.Namespace) -> Qwen3TTSModel:
         raise ValueError("--tokenizer-dir is required when --backend trt")
 
     module_name = os.getenv("TRT_QWEN_TTS_MODULE", "trt_qwen_tts")
+    logger.info("Loading TRT backend: module=%s, engine=%s, tokenizer=%s",
+                module_name, engine_path, tokenizer_dir)
     try:
         mod = importlib.import_module(module_name)
     except Exception as e:
+        logger.error("Failed to import TRT module '%s': %s", module_name, e, exc_info=True)
         raise ImportError(
             f"Failed to import TRT backend module '{module_name}'. "
             "Set TRT_QWEN_TTS_MODULE to your module or ensure trt_qwen_tts.py is available."
         ) from e
 
     if not hasattr(mod, "TRTQwen3TTSModel"):
+        logger.error("Module '%s' does not expose TRTQwen3TTSModel", module_name)
         raise ImportError(f"Module '{module_name}' does not expose TRTQwen3TTSModel")
 
     cls = getattr(mod, "TRTQwen3TTSModel")
-    tts = cls.from_engine(engine_path=engine_path, tokenizer_dir=tokenizer_dir)
+    try:
+        tts = cls.from_engine(engine_path=engine_path, tokenizer_dir=tokenizer_dir)
+    except Exception as e:
+        logger.error("TRT engine loading failed (engine=%s): %s", engine_path, e, exc_info=True)
+        raise
+
+    logger.info("TRT engine loaded successfully")
 
     # Ensure model_type is visible to UI
     if not hasattr(tts, "model"):
@@ -2140,6 +2162,10 @@ def _load_trt_tts(args: argparse.Namespace) -> Qwen3TTSModel:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Initialize logging early — before any logger.xxx calls
+    setup_logging()
+    logger.info("Qwen3-TTS Jetson Gradio app starting")
 
     # Initialize Jetson hardware monitor (background thread)
     _get_monitor()
@@ -2195,7 +2221,7 @@ def main(argv=None) -> int:
     # demo = build_demo(tts, checkpoint, output_dir, save_audio=not args.no_save)
 
     if args.backend == "trt":
-        print("启动 Qwen3-TTS Gradio 界面 (TRT backend)...")
+        logger.info("启动 Qwen3-TTS Gradio 界面 (TRT backend)")
         output_dir = _ensure_output_dir(args.output_dir)
         tts = _load_trt_tts(args)
         demo = build_demo(
@@ -2206,20 +2232,16 @@ def main(argv=None) -> int:
             force_model_type=args.model_type or "voice_design",
         )
     else:
-        print("启动 Qwen3-TTS Gradio 界面...")
-        print("模型将在界面中选择后加载。")
+        logger.info("启动 Qwen3-TTS Gradio 界面 (torch backend)")
+        logger.info("模型将在界面中选择后加载")
         demo = build_lazy_demo(args)
 
     # 获取并显示访问地址
     local_ip = _get_local_ip()
     protocol = "https" if args.ssl_certfile else "http"
-    print("\n" + "=" * 50)
-    print("Gradio 服务启动中...")
-    print(f"本机访问: {protocol}://127.0.0.1:{args.port}")
-    print(f"局域网访问: {protocol}://{local_ip}:{args.port}")
-    if args.share:
-        print("公网链接将在下方显示...")
-    print("=" * 50 + "\n")
+    logger.info("Gradio 服务启动中 — 本机: %s://127.0.0.1:%s  局域网: %s://%s:%s%s",
+                protocol, args.port, protocol, local_ip, args.port,
+                " (公网分享已启用)" if args.share else "")
 
     demo.queue(default_concurrency_limit=int(args.concurrency)).launch(**launch_kwargs)
     return 0

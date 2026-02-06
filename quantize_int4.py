@@ -26,6 +26,10 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from log_config import get_logger, setup_logging
+
+logger = get_logger(__name__)
+
 
 def _add_local_qwen_repo() -> None:
     """Add local Qwen3-TTS repo to sys.path if available."""
@@ -76,8 +80,8 @@ def _load_model_cpu(model_dir: str):
     """Load Qwen3-TTS model to CPU in float16 for quantization."""
     from qwen_tts import Qwen3TTSModel
 
-    print(f"[Load] Loading model from {model_dir} to CPU (float32 first)...")
-    print(f"[Load] {_gpu_mem_info()}")
+    logger.info("Loading model from %s to CPU (float32 first)", model_dir)
+    logger.info("%s", _gpu_mem_info())
 
     tts = Qwen3TTSModel.from_pretrained(
         model_dir,
@@ -86,7 +90,7 @@ def _load_model_cpu(model_dir: str):
         attn_implementation=None,
         low_cpu_mem_usage=True,
     )
-    print(f"[Load] Model loaded to CPU. {_gpu_mem_info()}")
+    logger.info("Model loaded to CPU. %s", _gpu_mem_info())
     return tts
 
 
@@ -120,26 +124,26 @@ def quantize_torchao_int4(
     # Identify the talker sub-module (LLM body)
     talker = getattr(model, "talker", None)
     if talker is None:
-        print("[Warn] model.talker not found, quantizing entire model")
+        logger.warning("model.talker not found, quantizing entire model")
         talker = model
 
     total_linear = _count_linear_layers(talker)
-    print(f"[Quantize] Target: model.talker | Linear layers: {total_linear}")
-    print(f"[Quantize] Method: int4_weight_only(group_size={group_size})")
-    print(f"[Quantize] {_gpu_mem_info()}")
+    logger.info("Target: model.talker | Linear layers: %d", total_linear)
+    logger.info("Method: int4_weight_only(group_size=%d)", group_size)
+    logger.info("%s", _gpu_mem_info())
 
     # Move talker to GPU for quantization
-    print("[Quantize] Moving talker to GPU for quantization...")
+    logger.info("Moving talker to GPU for quantization...")
     talker = talker.to("cuda", dtype=torch.float16)
     gc.collect()
     torch.cuda.empty_cache()
-    print(f"[Quantize] {_gpu_mem_info()}")
+    logger.info("%s", _gpu_mem_info())
 
     # Apply INT4 quantization
     t0 = time.time()
     quantize_(talker, int4_weight_only(group_size=group_size))
     elapsed = time.time() - t0
-    print(f"[Quantize] INT4 quantization done in {elapsed:.1f}s")
+    logger.info("INT4 quantization done in %.1fs", elapsed)
 
     # Move back to CPU for saving
     talker = talker.to("cpu")
@@ -153,7 +157,7 @@ def quantize_torchao_int4(
         if "int4" in cls_name.lower() or "affine" in cls_name.lower() or "quant" in cls_name.lower():
             quantized_count += 1
 
-    print(f"[Quantize] Quantized layers detected: {quantized_count}")
+    logger.info("Quantized layers detected: %d", quantized_count)
 
     # Save
     output_path = Path(output_dir)
@@ -161,7 +165,7 @@ def quantize_torchao_int4(
 
     # Save the full model state dict
     model_save_path = output_path / "quantized_model.pt"
-    print(f"[Save] Saving quantized model to {model_save_path}...")
+    logger.info("Saving quantized model to %s", model_save_path)
     torch.save(model.state_dict(), str(model_save_path))
 
     # Copy config files from original model dir
@@ -188,8 +192,8 @@ def quantize_torchao_int4(
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
-    print(f"[Save] Quantization config: {config_path}")
-    print(f"[Done] Output: {output_dir}")
+    logger.info("Quantization config: %s", config_path)
+    logger.info("Output: %s", output_dir)
     return str(output_path)
 
 
@@ -207,12 +211,12 @@ def quantize_torch_dynamic_int8(
 
     talker = getattr(model, "talker", None)
     if talker is None:
-        print("[Warn] model.talker not found, quantizing entire model")
+        logger.warning("model.talker not found, quantizing entire model")
         talker = model
 
     total_linear = _count_linear_layers(talker)
-    print(f"[Quantize] Target: model.talker | Linear layers: {total_linear}")
-    print("[Quantize] Method: torch.ao.quantization.quantize_dynamic (INT8)")
+    logger.info("Target: model.talker | Linear layers: %d", total_linear)
+    logger.info("Method: torch.ao.quantization.quantize_dynamic (INT8)")
 
     t0 = time.time()
     torch.ao.quantization.quantize_dynamic(
@@ -222,7 +226,7 @@ def quantize_torch_dynamic_int8(
         inplace=True,
     )
     elapsed = time.time() - t0
-    print(f"[Quantize] INT8 dynamic quantization done in {elapsed:.1f}s")
+    logger.info("INT8 dynamic quantization done in %.1fs", elapsed)
 
     # Count quantized layers
     quantized_count = 0
@@ -231,14 +235,14 @@ def quantize_torch_dynamic_int8(
         if "dynamic" in cls_name.lower() or "quantized" in cls_name.lower():
             quantized_count += 1
 
-    print(f"[Quantize] Quantized layers: {quantized_count}/{total_linear}")
+    logger.info("Quantized layers: %d/%d", quantized_count, total_linear)
 
     # Save
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     model_save_path = output_path / "quantized_model.pt"
-    print(f"[Save] Saving quantized model to {model_save_path}...")
+    logger.info("Saving quantized model to %s", model_save_path)
     torch.save(model.state_dict(), str(model_save_path))
 
     # Copy config files
@@ -263,8 +267,8 @@ def quantize_torch_dynamic_int8(
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
-    print(f"[Save] Quantization config: {config_path}")
-    print(f"[Done] Output: {output_dir}")
+    logger.info("Quantization config: %s", config_path)
+    logger.info("Output: %s", output_dir)
     return str(output_path)
 
 
@@ -290,7 +294,7 @@ def load_quantized_model(model_dir: str, quantized_dir: str):
         qconfig = json.load(f)
 
     method = qconfig.get("method", "unknown")
-    print(f"[Load] Loading quantized model (method={method}) from {quantized_dir}")
+    logger.info("Loading quantized model (method=%s) from %s", method, quantized_dir)
 
     # For torchao INT4, we need to load the model structure first then apply weights
     if method == "torchao_int4_weight_only":
@@ -318,7 +322,7 @@ def load_quantized_model(model_dir: str, quantized_dir: str):
         # Load saved weights
         state_dict = torch.load(str(model_path), map_location="cpu", weights_only=False)
         tts.model.load_state_dict(state_dict, strict=False)
-        print(f"[Load] INT4 model loaded successfully")
+        logger.info("INT4 model loaded successfully")
         return tts
 
     elif method == "torch_dynamic_int8":
@@ -339,7 +343,7 @@ def load_quantized_model(model_dir: str, quantized_dir: str):
         )
         state_dict = torch.load(str(model_path), map_location="cpu", weights_only=False)
         tts.model.load_state_dict(state_dict, strict=False)
-        print(f"[Load] INT8 model loaded successfully")
+        logger.info("INT8 model loaded successfully")
         return tts
 
     else:
@@ -348,7 +352,7 @@ def load_quantized_model(model_dir: str, quantized_dir: str):
 
 def verify_quantized_model(model_dir: str, quantized_dir: str) -> bool:
     """Run a short inference to verify the quantized model works."""
-    print("\n[Verify] Running test inference with quantized model...")
+    logger.info("Running test inference with quantized model...")
 
     try:
         tts = load_quantized_model(model_dir, quantized_dir)
@@ -364,17 +368,17 @@ def verify_quantized_model(model_dir: str, quantized_dir: str) -> bool:
                     speech_tok.model = speech_tok.model.to(device)
                     speech_tok.device = torch.device(device)
                 except Exception:
-                    pass
+                    logger.debug("Failed to move speech_tokenizer to %s", device, exc_info=True)
             if speaker_enc is not None:
                 try:
                     speaker_enc = speaker_enc.to(device)
                 except Exception:
-                    pass
+                    logger.debug("Failed to move speaker_encoder to %s", device, exc_info=True)
             tts.device = torch.device(device)
 
         # Detect model type for test
         model_type = getattr(tts.model, "tts_model_type", "voice_design")
-        print(f"[Verify] Model type: {model_type}, device: {device}")
+        logger.info("Model type: %s, device: %s", model_type, device)
 
         t0 = time.time()
         if model_type == "voice_design":
@@ -385,20 +389,19 @@ def verify_quantized_model(model_dir: str, quantized_dir: str) -> bool:
                 max_new_tokens=256,
             )
         elif model_type == "base":
-            print("[Verify] Base model requires reference audio, skipping generation test.")
-            print("[Verify] Model loaded successfully (structure OK)")
+            logger.info("Base model requires reference audio, skipping generation test")
+            logger.info("Model loaded successfully (structure OK)")
             return True
         else:
-            print(f"[Verify] Model type '{model_type}' — skipping generation, structure OK")
+            logger.info("Model type '%s' — skipping generation, structure OK", model_type)
             return True
 
         elapsed = time.time() - t0
         audio_len = len(wavs[0]) / sr if sr > 0 else 0
         rtf = elapsed / audio_len if audio_len > 0 else float("inf")
 
-        print(f"[Verify] Test passed!")
-        print(f"[Verify] Generated {audio_len:.2f}s audio in {elapsed:.2f}s (RTF={rtf:.2f})")
-        print(f"[Verify] Sample rate: {sr}")
+        logger.info("Verification passed: %.2fs audio in %.2fs (RTF=%.2f, sr=%d)",
+                     audio_len, elapsed, rtf, sr)
 
         # Optionally save test audio
         test_audio_path = Path(quantized_dir) / "test_output.wav"
@@ -406,16 +409,14 @@ def verify_quantized_model(model_dir: str, quantized_dir: str) -> bool:
             import numpy as np
             import soundfile as sf
             sf.write(str(test_audio_path), wavs[0], sr)
-            print(f"[Verify] Test audio saved: {test_audio_path}")
+            logger.info("Test audio saved: %s", test_audio_path)
         except Exception:
-            pass
+            logger.debug("Failed to save test audio", exc_info=True)
 
         return True
 
     except Exception as e:
-        print(f"[Verify] FAILED: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error("Verification FAILED: %s", e, exc_info=True)
         return False
 
 
@@ -428,6 +429,7 @@ def get_quantization_info(quantized_dir: str) -> Optional[Dict[str, Any]]:
         with open(config_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
+        logger.debug("Failed to read quantization config at %s", config_path, exc_info=True)
         return None
 
 
@@ -483,20 +485,21 @@ Examples:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    setup_logging()
 
     model_dir = Path(args.model_dir).expanduser().resolve()
     if not model_dir.exists():
-        print(f"[Error] Model directory not found: {model_dir}")
+        logger.error("Model directory not found: %s", model_dir)
         return 1
 
     # Validate model dir
     has_config = (model_dir / "config.json").exists()
     has_weights = any(model_dir.glob("*.safetensors")) or any(model_dir.glob("*.bin"))
     if not has_config:
-        print(f"[Error] config.json not found in {model_dir}")
+        logger.error("config.json not found in %s", model_dir)
         return 1
     if not has_weights:
-        print(f"[Error] No weight files found in {model_dir}")
+        logger.error("No weight files found in %s", model_dir)
         return 1
 
     # Determine method
@@ -504,15 +507,14 @@ def main(argv=None) -> int:
     if method == "auto":
         if _check_torchao():
             method = "int4"
-            print("[Info] torchao available, using INT4 quantization")
+            logger.info("torchao available, using INT4 quantization")
         else:
             method = "int8"
-            print("[Info] torchao not available, falling back to INT8 quantization")
+            logger.info("torchao not available, falling back to INT8 quantization")
 
     if method == "int4" and not _check_torchao():
-        print("[Error] torchao is required for INT4 quantization but not installed.")
-        print("[Info] Install: pip install torchao")
-        print("[Info] Or use --method int8 for fallback.")
+        logger.error("torchao is required for INT4 quantization but not installed. "
+                      "Install: pip install torchao  |  Or use --method int8 for fallback.")
         return 1
 
     # Determine output dir
@@ -522,20 +524,19 @@ def main(argv=None) -> int:
 
     # Check if already quantized
     if not args.force and (output_path / "quantize_config.json").exists():
-        print(f"[Skip] Quantized model already exists: {output_path}")
-        print("[Info] Use --force to re-quantize.")
+        logger.info("Quantized model already exists: %s (use --force to re-quantize)", output_path)
         if args.verify:
             ok = verify_quantized_model(str(model_dir), str(output_path))
             return 0 if ok else 1
         return 0
 
-    print("=" * 60)
-    print(f"Qwen3-TTS {method.upper()} Quantization")
-    print(f"  Source:  {model_dir}")
-    print(f"  Output:  {output_path}")
+    logger.info("=" * 60)
+    logger.info("Qwen3-TTS %s Quantization", method.upper())
+    logger.info("  Source:  %s", model_dir)
+    logger.info("  Output:  %s", output_path)
     if method == "int4":
-        print(f"  Group:   {args.group_size}")
-    print("=" * 60)
+        logger.info("  Group:   %d", args.group_size)
+    logger.info("=" * 60)
 
     # Run quantization
     t_start = time.time()
@@ -552,24 +553,22 @@ def main(argv=None) -> int:
                 output_dir=str(output_path),
             )
     except Exception as e:
-        print(f"\n[Error] Quantization failed: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error("Quantization failed: %s", e, exc_info=True)
 
         # If INT4 failed and method was auto-selected, suggest fallback
         if method == "int4":
-            print("\n[Hint] Try --method int8 as fallback:")
-            print(f"  python3 {__file__} --model-dir {model_dir} --method int8")
+            logger.info("Hint: try --method int8 as fallback: "
+                        "python3 %s --model-dir %s --method int8", __file__, model_dir)
         return 1
 
     t_total = time.time() - t_start
-    print(f"\n[Done] Quantization completed in {t_total:.1f}s")
+    logger.info("Quantization completed in %.1fs", t_total)
 
     # Verify if requested
     if args.verify:
         ok = verify_quantized_model(str(model_dir), str(output_path))
         if not ok:
-            print("[Warn] Verification failed, but quantized model was saved.")
+            logger.warning("Verification failed, but quantized model was saved")
             return 1
 
     return 0

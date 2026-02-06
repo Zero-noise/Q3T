@@ -21,6 +21,10 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from log_config import get_logger, setup_logging
+
+logger = get_logger(__name__)
+
 
 def _path(p: Optional[str]) -> Optional[Path]:
     if not p:
@@ -29,10 +33,11 @@ def _path(p: Optional[str]) -> Optional[Path]:
 
 
 def _run(cmd: List[str], desc: str) -> None:
-    """Run a command, printing it first."""
-    print(f"[{desc}] {' '.join(cmd)}")
+    """Run a command, logging it first."""
+    logger.info("[%s] %s", desc, " ".join(cmd))
     result = subprocess.run(cmd)
     if result.returncode != 0:
+        logger.error("[%s] failed with exit code %d", desc, result.returncode)
         raise RuntimeError(f"{desc} failed with exit code {result.returncode}")
 
 
@@ -74,10 +79,11 @@ Examples:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    setup_logging()
 
     model_dir = _path(args.model_dir)
     if not model_dir or not model_dir.exists():
-        print(f"[Error] Model directory not found: {args.model_dir}")
+        logger.error("Model directory not found: %s", args.model_dir)
         return 1
 
     int4_dir = _path(args.int4_dir) or Path(str(model_dir) + "-INT4")
@@ -89,17 +95,17 @@ def main(argv=None) -> int:
 
     # Step 1: Quantization
     if args.skip_quantize:
-        print("[Skip] Quantization skipped. Using FP16 model directly.")
+        logger.info("Quantization skipped. Using FP16 model directly.")
         checkpoint = str(model_dir)
     elif _quantized_ready(int4_dir) and not args.force_quantize:
-        print(f"[OK] Quantized model found: {int4_dir}")
+        logger.info("Quantized model found: %s", int4_dir)
         checkpoint = str(model_dir)  # Gradio app loads FP16 structure; INT4 dir for reference
     else:
         if not quantize_script.exists():
-            print(f"[Error] quantize_int4.py not found at {quantize_script}")
+            logger.error("quantize_int4.py not found at %s", quantize_script)
             return 1
 
-        print("[Quantize] Starting INT4 quantization...")
+        logger.info("Starting INT4 quantization...")
         quant_cmd = [
             sys.executable,
             str(quantize_script),
@@ -111,11 +117,11 @@ def main(argv=None) -> int:
             quant_cmd.append("--force")
 
         if args.dry_run:
-            print(f"[Dry-Run] {' '.join(quant_cmd)}")
+            logger.info("[Dry-Run] %s", " ".join(quant_cmd))
         else:
             _run(quant_cmd, "Quantize")
             if not _quantized_ready(int4_dir):
-                print(f"[Error] Quantization finished but output not found: {int4_dir}")
+                logger.error("Quantization finished but output not found: %s", int4_dir)
                 return 1
 
         checkpoint = str(model_dir)
@@ -135,13 +141,11 @@ def main(argv=None) -> int:
     ]
 
     if args.dry_run:
-        print(f"[Dry-Run] {' '.join(gradio_cmd)}")
+        logger.info("[Dry-Run] %s", " ".join(gradio_cmd))
         return 0
 
-    print("\n[Launch] Starting Gradio app...")
-    print(f"[Launch] Model: {checkpoint}")
-    print(f"[Launch] INT4:  {int4_dir}")
-    print(f"[Launch] URL:   http://{args.ip}:{args.port}")
+    logger.info("Starting Gradio app — Model: %s | INT4: %s | URL: http://%s:%d",
+                checkpoint, int4_dir, args.ip, args.port)
 
     _run(gradio_cmd, "Gradio")
     return 0
