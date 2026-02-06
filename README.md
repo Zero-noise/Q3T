@@ -97,10 +97,11 @@ pip install -e ./Qwen3-TTS
 - 命令行指定的路径
 
 支持的模型：
-- `Qwen/Qwen3-TTS-12Hz-0.6B-Base` - 语音克隆
-- `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` - 预定义说话人
-- `Qwen/Qwen3-TTS-12Hz-0.6B-VoiceDesign` - 文字描述控制风格
-- `Qwen/Qwen3-TTS-25Hz-0.6B-*` - 25Hz 版本 (质量更高)
+- `Qwen/Qwen3-TTS-12Hz-0.6B-Base` - 语音克隆 (轻量)
+- `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` - 预定义说话人 (轻量)
+- `Qwen/Qwen3-TTS-12Hz-1.7B-Base` - 语音克隆 (高质量)
+- `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` - 预定义说话人 (高质量)
+- `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` - 文字描述控制风格 (仅1.7B)
 
 ## 模型选择
 
@@ -109,7 +110,7 @@ pip install -e ./Qwen3-TTS
 | 0.6B-Base / CustomVoice | ~1.5 GB | ✅ 推荐 |
 | 1.7B 系列 | ~4 GB | ⚠️ 需 16GB+ |
 
-**12Hz vs 25Hz**: 12Hz 模型推理更快，25Hz 模型音质更高
+**0.6B vs 1.7B**: 0.6B 推理更快适合边缘部署，1.7B 质量更高。VoiceDesign 仅 1.7B 版本提供
 
 ## 故障排除
 

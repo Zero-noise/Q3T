@@ -9,7 +9,7 @@ Simplified workflow:
 3. Launch jetson_gradio_app.py with the quantized model
 
 Usage:
-    python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign
+    python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign
 """
 
 from __future__ import annotations
@@ -50,16 +50,16 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   # Default: quantize 0.6B model and launch Gradio
-  python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign
+  python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign
 
   # Skip quantization (use existing quantized model)
-  python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign --skip-quantize
+  python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign --skip-quantize
 
   # Force re-quantization
-  python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign --force-quantize
+  python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign --force-quantize
 
   # Custom port
-  python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign --port 7860
+  python3 jetson_int4_launcher.py --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign --port 7860
         """,
     )
     p.add_argument("--model-dir", required=True, help="FP16 model directory.")
