@@ -7,8 +7,8 @@ Primary: torchao int4_weight_only (quantize talker only)
 Fallback: torch.ao.quantization.quantize_dynamic INT8
 
 Usage:
-    python3 quantize_int4.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign
-    python3 quantize_int4.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign --verify
+    python3 quantize_int4.py --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+    python3 quantize_int4.py --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign --verify
     python3 quantize_int4.py --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign --method int8
 """
 
@@ -438,16 +438,16 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   # INT4 quantization (default)
-  python3 quantize_int4.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign
+  python3 quantize_int4.py --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign
 
   # INT4 with custom group size
-  python3 quantize_int4.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign --group-size 64
+  python3 quantize_int4.py --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign --group-size 64
 
   # Fallback to INT8
-  python3 quantize_int4.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign --method int8
+  python3 quantize_int4.py --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign --method int8
 
   # Quantize and verify
-  python3 quantize_int4.py --model-dir models/Qwen3-TTS-12Hz-0.6B-VoiceDesign --verify
+  python3 quantize_int4.py --model-dir models/Qwen3-TTS-12Hz-1.7B-VoiceDesign --verify
         """,
     )
     p.add_argument("--model-dir", required=True, help="FP16 model directory.")

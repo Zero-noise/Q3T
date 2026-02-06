@@ -447,10 +447,9 @@ def _move_speech_tokenizer(st, device: str, dtype: Optional[torch.dtype]) -> Non
 SUPPORTED_MODELS = [
     "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
     "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-    "Qwen/Qwen3-TTS-12Hz-0.6B-VoiceDesign",
-    "Qwen/Qwen3-TTS-25Hz-0.6B-Base",
-    "Qwen/Qwen3-TTS-25Hz-0.6B-CustomVoice",
-    "Qwen/Qwen3-TTS-25Hz-0.6B-VoiceDesign",
+    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
 ]
 
 
@@ -1086,7 +1085,7 @@ def build_download_ui() -> gr.Blocks:
                     label="选择模型",
                     choices=SUPPORTED_MODELS,
                     value=SUPPORTED_MODELS[0],
-                    info="12Hz 更快，25Hz 质量更高 | Base=语音克隆, CustomVoice=预设角色, VoiceDesign=风格描述"
+                    info="0.6B 轻量快速，1.7B 质量更高 | Base=语音克隆, CustomVoice=预设角色, VoiceDesign=风格描述(仅1.7B)"
                 )
 
                 default_root = _get_default_download_root()
@@ -1147,9 +1146,9 @@ def build_download_ui() -> gr.Blocks:
 - **CustomVoice**: 预定义说话人模型
 - **VoiceDesign**: 通过文字描述控制语音风格
 
-**采样率说明:**
-- **12Hz**: 更快的生成速度
-- **25Hz**: 更高的音频质量
+**参数规模说明:**
+- **0.6B**: 轻量版本，推理更快，适合 Jetson 部署（仅 Base 和 CustomVoice）
+- **1.7B**: 旗舰版本，质量更高（包含 VoiceDesign）
 
 下载完成后，使用显示的命令重启应用。
             """)
@@ -1466,7 +1465,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                         label="选择要下载的模型",
                         choices=SUPPORTED_MODELS,
                         value=SUPPORTED_MODELS[0],
-                        info="12Hz 更快，25Hz 质量更高 | Base=语音克隆, CustomVoice=预设角色, VoiceDesign=风格描述"
+                        info="0.6B 轻量快速，1.7B 质量更高 | Base=语音克隆, CustomVoice=预设角色, VoiceDesign=风格描述(仅1.7B)"
                     )
                 with gr.Column(scale=2):
                     download_dir_input = gr.Textbox(
