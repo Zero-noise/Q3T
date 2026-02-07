@@ -882,7 +882,6 @@ def _load_tts(args: argparse.Namespace) -> Qwen3TTSModel:
             device_map="cpu",
             torch_dtype=dtype if dtype not in (torch.float16, torch.bfloat16) else torch.float32,
             attn_implementation=attn_impl,
-            low_cpu_mem_usage=True,
         )
         if dtype in (torch.float16, torch.bfloat16):
             tts.model = tts.model.to(dtype=dtype)
