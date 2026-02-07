@@ -66,6 +66,31 @@ Examples:
     p.add_argument("--int4-dir", default=None, help="INT4 output dir (default: <model-dir>-INT4).")
     p.add_argument("--skip-quantize", action="store_true", help="Skip quantization, use FP16 model directly.")
     p.add_argument("--force-quantize", action="store_true", help="Force re-quantization.")
+    p.add_argument(
+        "--load-format",
+        choices=["auto", "fp16", "quantized"],
+        default="auto",
+        help="Load strategy in Gradio. auto prefers quantized model when available.",
+    )
+    p.add_argument(
+        "--quant-preference",
+        choices=["auto", "int4", "int8"],
+        default="int4",
+        help="Preferred quantized variant when multiple are available.",
+    )
+    p.add_argument(
+        "--autoload",
+        dest="autoload",
+        action="store_true",
+        default=True,
+        help="Auto-load selected model when Gradio page opens (default: on).",
+    )
+    p.add_argument(
+        "--no-autoload",
+        dest="autoload",
+        action="store_false",
+        help="Disable model auto-load; choose and load manually in UI.",
+    )
     p.add_argument("--port", type=int, default=8000, help="Gradio server port (default: 8000).")
     p.add_argument("--ip", default="0.0.0.0", help="Gradio bind IP (default: 0.0.0.0).")
     p.add_argument("--dry-run", action="store_true", help="Print commands without executing.")
@@ -90,10 +115,10 @@ def main(argv=None) -> int:
     # Step 1: Quantization
     if args.skip_quantize:
         print("[Skip] Quantization skipped. Using FP16 model directly.")
-        checkpoint = str(model_dir)
+        quantized_available = _quantized_ready(int4_dir)
     elif _quantized_ready(int4_dir) and not args.force_quantize:
         print(f"[OK] Quantized model found: {int4_dir}")
-        checkpoint = str(model_dir)  # Gradio app loads FP16 structure; INT4 dir for reference
+        quantized_available = True
     else:
         if not quantize_script.exists():
             print(f"[Error] quantize_int4.py not found at {quantize_script}")
@@ -118,13 +143,25 @@ def main(argv=None) -> int:
                 print(f"[Error] Quantization finished but output not found: {int4_dir}")
                 return 1
 
-        checkpoint = str(model_dir)
+        quantized_available = True
+
+    effective_load_format = args.load_format
+    if effective_load_format == "auto":
+        effective_load_format = "quantized" if quantized_available else "fp16"
+
+    if effective_load_format == "quantized" and not quantized_available:
+        print(
+            "[Error] Quantized load requested, but quantized model is not ready: "
+            f"{int4_dir}"
+        )
+        return 1
+
+    default_model_path = str(int4_dir if effective_load_format == "quantized" else model_dir)
 
     # Step 2: Launch Gradio
     gradio_cmd = [
         sys.executable,
         str(gradio_script),
-        checkpoint,
         "--device", "cuda",
         "--dtype", "float16",
         "--port", str(args.port),
@@ -132,15 +169,22 @@ def main(argv=None) -> int:
         "--no-flash-attn",
         "--staged-load",
         "--tokenizer-on-cpu",
+        "--default-model-path", default_model_path,
+        "--default-load-format", effective_load_format,
+        "--quant-preference", args.quant_preference,
     ]
+    if args.autoload:
+        gradio_cmd.append("--autoload-model")
 
     if args.dry_run:
         print(f"[Dry-Run] {' '.join(gradio_cmd)}")
         return 0
 
     print("\n[Launch] Starting Gradio app...")
-    print(f"[Launch] Model: {checkpoint}")
+    print(f"[Launch] Model: {model_dir}")
     print(f"[Launch] INT4:  {int4_dir}")
+    print(f"[Launch] Load:  {effective_load_format} (quant_pref={args.quant_preference})")
+    print(f"[Launch] UI default path: {default_model_path}")
     print(f"[Launch] URL:   http://{args.ip}:{args.port}")
 
     _run(gradio_cmd, "Gradio")

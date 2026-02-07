@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import gradio as gr
 import numpy as np
@@ -27,6 +27,7 @@ import torch
 from transformers.generation.logits_process import LogitsProcessorList
 
 _STARTUP_CWD = Path.cwd().resolve()
+_SCRIPT_DIR = Path(__file__).resolve().parent
 
 class _NanClampLogitsProcessor:
     def __call__(self, input_ids, scores):
@@ -459,6 +460,85 @@ def _validate_model_dir(model_dir: Path) -> Tuple[bool, bool]:
     return has_config, has_weights
 
 
+def _validate_quantized_dir(model_dir: Path) -> bool:
+    return (model_dir / "quantize_config.json").exists() and (model_dir / "quantized_model.pt").exists()
+
+
+def _read_quantize_config(model_dir: Path) -> Optional[Dict[str, Any]]:
+    config_path = model_dir / "quantize_config.json"
+    if not config_path.exists():
+        return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _normalize_quant_method(config: Optional[Dict[str, Any]]) -> str:
+    method = (config or {}).get("method", "quantized")
+    method_lower = str(method).lower()
+    if "int4" in method_lower:
+        return "int4"
+    if "int8" in method_lower:
+        return "int8"
+    return "quantized"
+
+
+def _resolve_quantized_source_dir(model_dir: Path) -> Optional[Path]:
+    qcfg = _read_quantize_config(model_dir) or {}
+    src = qcfg.get("source_model_dir")
+    if src:
+        src_path = Path(src).expanduser()
+        if src_path.exists():
+            has_config, has_weights = _validate_model_dir(src_path)
+            if has_config and has_weights:
+                return src_path.resolve()
+
+    name = model_dir.name
+    for suffix in ("-INT4", "-INT8"):
+        if name.endswith(suffix):
+            candidate = model_dir.with_name(name[: -len(suffix)])
+            has_config, has_weights = _validate_model_dir(candidate)
+            if has_config and has_weights:
+                return candidate.resolve()
+    return None
+
+
+def _find_quantized_variants_for_model(model_dir: Path) -> Dict[str, Path]:
+    variants: Dict[str, Path] = {}
+    default_candidates = {
+        "int4": Path(str(model_dir) + "-INT4"),
+        "int8": Path(str(model_dir) + "-INT8"),
+    }
+    for key, path in default_candidates.items():
+        if _validate_quantized_dir(path):
+            variants[key] = path.resolve()
+
+    parent = model_dir.parent
+    try:
+        for sub in parent.iterdir():
+            if not sub.is_dir() or not _validate_quantized_dir(sub):
+                continue
+            src_dir = _resolve_quantized_source_dir(sub)
+            if src_dir is None:
+                continue
+            if src_dir.resolve() != model_dir.resolve():
+                continue
+            method = _normalize_quant_method(_read_quantize_config(sub))
+            variants.setdefault(method, sub.resolve())
+    except (PermissionError, OSError):
+        pass
+    return variants
+
+
+def _choose_quantized_variant(variants: Dict[str, Path], preference: str) -> Optional[Path]:
+    pref = (preference or "auto").strip().lower()
+    if pref in ("int4", "int8"):
+        return variants.get(pref)
+    return variants.get("int4") or variants.get("int8") or variants.get("quantized")
+
+
 def _get_hf_cache_dirs() -> List[Path]:
     """获取 HuggingFace 常见的缓存目录列表"""
     cache_dirs = []
@@ -526,6 +606,27 @@ def _find_model_in_hf_cache(repo_id: str) -> Optional[Path]:
     return None
 
 
+def _find_model_in_local_locations(repo_id: str) -> Optional[Path]:
+    safe_repo = repo_id.replace("/", "__")
+    short_name = repo_id.split("/")[-1]
+    candidates = (safe_repo, short_name)
+    for location in _get_all_model_locations():
+        root = Path(location)
+        checks = [
+            root / candidates[0],
+            root / candidates[1],
+            root / "models" / candidates[0],
+            root / "models" / candidates[1],
+        ]
+        for p in checks:
+            if not p.exists():
+                continue
+            has_config, has_weights = _validate_model_dir(p)
+            if has_config and has_weights:
+                return p.resolve()
+    return None
+
+
 def _check_model_downloaded(checkpoint: str) -> Dict[str, Any]:
     # 1. 检查是否是本地路径
     if os.path.exists(checkpoint):
@@ -537,6 +638,14 @@ def _check_model_downloaded(checkpoint: str) -> Dict[str, Any]:
                 "error": "checkpoint 必须是目录或 HuggingFace repo id",
             }
         if ckpt_path.is_dir():
+            if _validate_quantized_dir(ckpt_path):
+                source_dir = _resolve_quantized_source_dir(ckpt_path)
+                return {
+                    "status": "local_quantized",
+                    "path": str(ckpt_path.resolve()),
+                    "source_model_dir": str(source_dir) if source_dir else None,
+                    "error": None if source_dir else "量化目录可用，但未找到可访问的原始 FP 模型目录",
+                }
             has_config, has_weights = _validate_model_dir(ckpt_path)
             status = "local_dir" if (has_config and has_weights) else "local_dir_invalid"
             return {
@@ -587,7 +696,12 @@ def _check_model_downloaded(checkpoint: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 4. 手动搜索 HuggingFace 缓存目录
+    # 4. 扫描项目目录及常见本地目录
+    found_local = _find_model_in_local_locations(checkpoint)
+    if found_local:
+        return {"status": "local_dir", "path": str(found_local)}
+
+    # 5. 手动搜索 HuggingFace 缓存目录
     found_path = _find_model_in_hf_cache(checkpoint)
     if found_path:
         return {"status": "cached", "path": str(found_path)}
@@ -633,10 +747,13 @@ def _system_check_summary(checkpoint: str, output_dir: str, model: Any = None) -
 
     lines = []
     lines.append(f"模型检查: {model_status.get('status')}")
-    if model_status.get("status") in {"local_dir", "local_dir_invalid", "cached_invalid"}:
+    if model_status.get("status") in {"local_dir", "local_dir_invalid", "cached_invalid", "local_quantized"}:
         lines.append(f"- 路径: {model_status.get('path')}")
-        lines.append(f"- config.json: {model_status.get('has_config')}")
-        lines.append(f"- 权重文件: {model_status.get('has_weights')}")
+        if model_status.get("status") != "local_quantized":
+            lines.append(f"- config.json: {model_status.get('has_config')}")
+            lines.append(f"- 权重文件: {model_status.get('has_weights')}")
+        else:
+            lines.append(f"- 原始模型: {model_status.get('source_model_dir') or '未检测到'}")
         if model_status.get("error"):
             lines.append(f"- 错误: {model_status.get('error')}")
     elif model_status.get("status") in {"local_file", "cached"}:
@@ -734,7 +851,29 @@ def _load_tts(args: argparse.Namespace) -> Qwen3TTSModel:
 
     use_staged = bool(getattr(args, "staged_load", False))
     tokenizer_on_cpu = bool(getattr(args, "tokenizer_on_cpu", False))
+    quantized_dir = (getattr(args, "quantized_dir", None) or "").strip()
     print(f"[Load] staged_load={'on' if use_staged else 'off'} | tokenizer_on_cpu={'on' if tokenizer_on_cpu else 'off'}")
+
+    if quantized_dir:
+        if device_map != "cuda":
+            raise ValueError("量化模型当前仅支持 CUDA 加载，请将 Device 设置为 cuda/cuda:0。")
+        qdir = Path(quantized_dir).expanduser().resolve()
+        if not _validate_quantized_dir(qdir):
+            raise ValueError(f"无效的量化目录: {qdir}")
+        print(f"[Load] quantized_dir={qdir}")
+        from quantize_int4 import load_quantized_model
+
+        tts = load_quantized_model(args.checkpoint, str(qdir))
+        tts.device = torch.device("cuda")
+        if hasattr(tts.model, "device"):
+            tts.model.device = torch.device("cuda")
+        if hasattr(tts.model, "speech_tokenizer"):
+            st = getattr(tts.model, "speech_tokenizer", None)
+            if tokenizer_on_cpu:
+                _move_speech_tokenizer(st, "cpu", dtype)
+            else:
+                _move_speech_tokenizer(st, "cuda", dtype)
+        return tts
 
     if use_staged and device_map == "cuda":
         print("[Load] staged_load path: CPU -> dtype -> GPU")
@@ -1057,7 +1196,12 @@ def _download_model(repo_id: str, local_dir: Optional[str], progress=gr.Progress
         progress(0.1, desc="正在下载模型文件...")
         result_path = snapshot_download(**kwargs)
         progress(1.0, desc="下载完成!")
-        return f"下载成功!\n模型路径: {result_path}\n\n请重启应用并使用以下命令:\npython jetson_gradio_app.py {result_path}"
+        return (
+            "下载成功!\n"
+            f"模型路径: {result_path}\n\n"
+            "请重启应用并使用以下命令:\n"
+            f"python jetson_gradio_app.py --default-model-path {result_path} --autoload-model"
+        )
     except Exception as e:
         return f"下载失败: {str(e)}"
 
@@ -1076,7 +1220,10 @@ def build_download_ui() -> gr.Blocks:
                 gr.Markdown(cached_info)
                 gr.Markdown("可以使用以下命令直接启动:")
                 for m in cached_models:
-                    gr.Code(f"python jetson_gradio_app.py {m['path']}", language="bash")
+                    gr.Code(
+                        f"python jetson_gradio_app.py --default-model-path {m['path']} --autoload-model",
+                        language="bash",
+                    )
 
         # 下载新模型
         with gr.Accordion("下载新模型", open=not cached_models):
@@ -1132,8 +1279,16 @@ def build_download_ui() -> gr.Blocks:
                 if not path or not path.strip():
                     return "请输入路径"
                 result = _check_model_downloaded(path.strip())
-                if result["status"] in ("local_dir", "cached"):
-                    return f"✅ 检测到有效模型!\n路径: {result.get('path', path)}\n\n启动命令:\npython jetson_gradio_app.py {result.get('path', path)}"
+                if result["status"] in ("local_dir", "cached") or (
+                    result["status"] == "local_quantized" and not result.get("error")
+                ):
+                    valid_path = result.get("path", path)
+                    return (
+                        "✅ 检测到有效模型!\n"
+                        f"路径: {valid_path}\n\n"
+                        "启动命令:\n"
+                        f"python jetson_gradio_app.py --default-model-path {valid_path} --autoload-model"
+                    )
                 return f"❌ 未检测到有效模型\n状态: {result['status']}\n错误: {result.get('error', '路径不存在或缺少必要文件')}"
 
             check_btn.click(check_manual_path, inputs=[manual_path], outputs=[check_result])
@@ -1294,6 +1449,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Auto-detect and use the first available cached model.",
     )
     parser.add_argument(
+        "--default-model-path",
+        default=None,
+        help="Default model path shown in lazy UI (supports FP model dir or quantized dir).",
+    )
+    parser.add_argument(
+        "--default-load-format",
+        choices=["auto", "fp16", "quantized"],
+        default="auto",
+        help="Default load strategy in lazy UI. auto prefers quantized model when available.",
+    )
+    parser.add_argument(
+        "--quant-preference",
+        choices=["auto", "int4", "int8"],
+        default="auto",
+        help="Preferred quantized variant when multiple are found.",
+    )
+    parser.add_argument(
+        "--autoload-model",
+        action="store_true",
+        help="Auto-load --default-model-path on page load in lazy UI.",
+    )
+    parser.add_argument(
         "--backend",
         choices=["torch", "trt"],
         default="torch",
@@ -1334,6 +1511,14 @@ def _scan_local_models() -> List[Dict[str, Any]]:
     return found
 
 
+def _model_choice_label(model: Dict[str, Any]) -> str:
+    base = f"{model.get('name', Path(model['path']).name)} [{model.get('format', 'fp')}] ({model.get('type', 'unknown')})"
+    location = model.get("location")
+    if location:
+        return f"{base} @ {location}"
+    return base
+
+
 def _scan_models_in_directory(directory: str) -> List[Dict[str, Any]]:
     """扫描指定目录下的所有有效模型"""
     found = []
@@ -1344,29 +1529,56 @@ def _scan_models_in_directory(directory: str) -> List[Dict[str, Any]]:
     if not dir_path.exists() or not dir_path.is_dir():
         return found
 
-    try:
-        # 检查目录本身是否是模型目录
-        has_config, has_weights = _validate_model_dir(dir_path)
-        if has_config and has_weights:
-            found.append({
-                "name": dir_path.name,
-                "path": str(dir_path),
-                "type": _detect_model_type(dir_path),
-            })
-            return found
+    seen: Set[Path] = set()
 
-        # 扫描子目录
-        for sub in sorted(dir_path.iterdir()):
-            if sub.is_dir():
-                has_config, has_weights = _validate_model_dir(sub)
-                if has_config and has_weights:
-                    found.append({
-                        "name": sub.name,
-                        "path": str(sub),
-                        "type": _detect_model_type(sub),
-                    })
+    def _add_if_model(path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except (PermissionError, OSError):
+            return
+        if resolved in seen:
+            return
+        if _validate_quantized_dir(resolved):
+            qcfg = _read_quantize_config(resolved)
+            source_dir = _resolve_quantized_source_dir(resolved)
+            found.append(
+                {
+                    "name": resolved.name,
+                    "path": str(resolved),
+                    "type": _detect_model_type(resolved),
+                    "format": _normalize_quant_method(qcfg),
+                    "source_model_dir": str(source_dir) if source_dir else None,
+                }
+            )
+            seen.add(resolved)
+            return
+        has_config, has_weights = _validate_model_dir(resolved)
+        if has_config and has_weights:
+            found.append(
+                {
+                    "name": resolved.name,
+                    "path": str(resolved),
+                    "type": _detect_model_type(resolved),
+                    "format": "fp16/fp32",
+                }
+            )
+            seen.add(resolved)
+
+    max_depth = 3
+    try:
+        for root, dirs, _files in os.walk(dir_path):
+            root_path = Path(root)
+            depth = len(root_path.relative_to(dir_path).parts)
+            if depth > max_depth:
+                dirs[:] = []
+                continue
+            _add_if_model(root_path)
+            if depth >= max_depth:
+                dirs[:] = []
     except (PermissionError, OSError):
         pass
+
+    found.sort(key=lambda x: (x.get("name", ""), x.get("format", ""), x.get("path", "")))
 
     return found
 
@@ -1390,14 +1602,17 @@ def _get_all_model_locations() -> List[str]:
     """获取所有可能的模型位置"""
     locations = []
 
-    # 1. 当前工作目录
-    cwd = str(Path.cwd().resolve())
-    locations.append(cwd)
+    # 1. 项目目录 + 当前工作目录
+    locations.append(str(_SCRIPT_DIR.resolve()))
+    locations.append(str((_SCRIPT_DIR / "models").resolve()))
+    locations.append(str(_STARTUP_CWD))
+    locations.append(str(Path.cwd().resolve()))
 
     # 2. 环境变量指定的目录
     env_root = os.getenv("QWEN3_TTS_DOWNLOAD_DIR")
     if env_root:
         locations.append(str(Path(env_root).expanduser().resolve()))
+    locations.append(str(_get_default_download_root()))
 
     # 3. HuggingFace 缓存目录
     for cache_dir in _get_hf_cache_dirs():
@@ -1430,23 +1645,88 @@ def _get_all_model_locations() -> List[str]:
     return result
 
 
+def _resolve_load_selection(model_path: str, load_format: str, quant_preference: str) -> Tuple[str, Optional[str], str]:
+    requested = (model_path or "").strip()
+    if not requested:
+        raise ValueError("模型路径为空")
+
+    mode = (load_format or "auto").strip().lower()
+    quant_pref = (quant_preference or "auto").strip().lower()
+    if mode not in {"auto", "fp16", "quantized"}:
+        mode = "auto"
+    if quant_pref not in {"auto", "int4", "int8"}:
+        quant_pref = "auto"
+
+    if not os.path.exists(requested):
+        if mode == "quantized":
+            raise ValueError("量化模式仅支持本地目录，请先选择本地模型路径。")
+        return requested, None, "fp16"
+
+    path = Path(requested).expanduser().resolve()
+    if path.is_file():
+        raise ValueError("模型路径必须是目录")
+
+    if _validate_quantized_dir(path):
+        source_dir = _resolve_quantized_source_dir(path)
+        if source_dir is None:
+            raise ValueError(f"量化目录存在，但未找到可访问的原始模型目录: {path}")
+        if mode == "fp16":
+            return str(source_dir), None, "fp16"
+        return str(source_dir), str(path), _normalize_quant_method(_read_quantize_config(path))
+
+    has_config, has_weights = _validate_model_dir(path)
+    if not has_config or not has_weights:
+        raise ValueError(f"无效的模型路径: {path} (缺少 config.json 或权重文件)")
+
+    if mode == "fp16":
+        return str(path), None, "fp16"
+
+    variants = _find_quantized_variants_for_model(path)
+    chosen = _choose_quantized_variant(variants, quant_pref)
+    if chosen is not None:
+        return str(path), str(chosen), _normalize_quant_method(_read_quantize_config(chosen))
+    if mode == "quantized":
+        raise ValueError(
+            f"未找到可用量化目录。期望例如: {path}-INT4 或 {path}-INT8"
+        )
+    return str(path), None, "fp16"
+
+
 def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
     """构建延迟加载模型的界面 - 先启动UI，后加载模型"""
     if args.backend != "torch":
         raise ValueError("Lazy demo only supports --backend torch.")
     # 使用可变容器存储模型状态
-    state = {"tts": None, "checkpoint": None, "model_type": None, "sanitize_logits": True}
+    state = {
+        "tts": None,
+        "checkpoint": None,
+        "quantized_dir": None,
+        "model_type": None,
+        "sanitize_logits": True,
+        "load_format": "fp16",
+    }
     output_dir = _ensure_output_dir(args.output_dir)
     save_audio = not args.no_save
 
     # 启动时扫描可能的模型位置
     all_locations = _get_all_model_locations()
+    requested_default = (args.default_model_path or args.checkpoint or "").strip()
     default_location = all_locations[0] if all_locations else str(Path.cwd())
+    if requested_default:
+        requested_path = Path(requested_default).expanduser()
+        if requested_path.exists():
+            requested_path = requested_path.resolve()
+            default_location = str(requested_path if requested_path.is_dir() else requested_path.parent)
+        else:
+            default_location = str(requested_path.parent.resolve())
+    if default_location not in all_locations:
+        all_locations = [default_location] + all_locations
 
     # 扫描默认位置的模型
     initial_models = _scan_models_in_directory(default_location)
-    initial_model_choices = [f"{m['name']} ({m['type']})" for m in initial_models]
-    initial_model_paths = {f"{m['name']} ({m['type']})": m['path'] for m in initial_models}
+    initial_model_choices = [_model_choice_label(m) for m in initial_models]
+    initial_model_paths = {_model_choice_label(m): m["path"] for m in initial_models}
+    initial_path_value = requested_default or (initial_models[0]["path"] if initial_models else "")
 
     with gr.Blocks(title="Qwen3-TTS") as demo:
         gr.Markdown("# Qwen3-TTS Jetson Orin")
@@ -1527,7 +1807,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
                         model_path_display = gr.Textbox(
                             label="模型完整路径",
-                            value=initial_models[0]['path'] if initial_models else "",
+                            value=initial_path_value,
                             interactive=True,
                             info="可直接编辑路径，或通过上方下拉框选择"
                         )
@@ -1547,6 +1827,18 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                             label="精度 (DType)",
                             choices=["float16", "bfloat16", "float32"],
                             value="float16" if args.dtype in ["fp16", "float16"] else args.dtype,
+                        )
+                        load_format_dropdown = gr.Dropdown(
+                            label="加载策略",
+                            choices=["auto", "quantized", "fp16"],
+                            value=args.default_load_format,
+                            info="auto: 若存在量化目录则优先量化；quantized: 强制量化；fp16: 强制原始模型",
+                        )
+                        quant_pref_dropdown = gr.Dropdown(
+                            label="量化偏好",
+                            choices=["auto", "int4", "int8"],
+                            value=args.quant_preference,
+                            info="当同时存在 INT4/INT8 目录时生效",
                         )
 
                         with gr.Row():
@@ -1593,8 +1885,8 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                         f"在 {location} 未找到有效模型"
                     )
 
-                choices = [f"{m['name']} ({m['type']})" for m in models]
-                paths = {f"{m['name']} ({m['type']})": m['path'] for m in models}
+                choices = [_model_choice_label(m) for m in models]
+                paths = {_model_choice_label(m): m["path"] for m in models}
 
                 return (
                     gr.update(choices=choices, value=choices[0]),
@@ -1635,6 +1927,7 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                                 "name": repo_id.split("/")[-1],
                                 "path": path,
                                 "type": _detect_model_type(Path(path)),
+                                "format": "fp16/fp32",
                                 "location": "HuggingFace Cache"
                             })
 
@@ -1646,8 +1939,8 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                         "未找到任何模型。请先下载模型。"
                     )
 
-                choices = [f"{m['name']} ({m['type']}) @ {m.get('location', 'local')}" for m in all_models]
-                paths = {c: m['path'] for c, m in zip(choices, all_models)}
+                choices = [_model_choice_label(m) for m in all_models]
+                paths = {_model_choice_label(m): m["path"] for m in all_models}
 
                 return (
                     gr.update(choices=choices, value=choices[0]),
@@ -1832,7 +2125,17 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
         )
 
         # ===== 加载模型逻辑 =====
-        def load_model_fn(model_path: str, device_in: str, dtype_in: str, flash_attn_in: bool, sanitize_logits_in: bool, staged_load_in: bool, tokenizer_cpu_in: bool):
+        def load_model_fn(
+            model_path: str,
+            device_in: str,
+            dtype_in: str,
+            load_format_in: str,
+            quant_pref_in: str,
+            flash_attn_in: bool,
+            sanitize_logits_in: bool,
+            staged_load_in: bool,
+            tokenizer_cpu_in: bool,
+        ):
             nonlocal state
 
             if not model_path or not model_path.strip():
@@ -1850,25 +2153,11 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
             try:
                 checkpoint = model_path.strip()
 
-                # 验证模型路径
-                model_dir = Path(checkpoint)
-                if model_dir.exists():
-                    has_config, has_weights = _validate_model_dir(model_dir)
-                    if not has_config or not has_weights:
-                        return (
-                            f"无效的模型路径: {checkpoint}\n缺少 config.json 或权重文件",
-                            gr.update(visible=False),
-                            "",
-                            "",
-                            gr.update(visible=False),
-                            gr.update(visible=False),
-                            gr.update(visible=False),
-                            gr.update(choices=[], value=None),
-                        )
-
                 # 应用加载参数
                 args.device = (device_in or "").strip() or args.device
                 args.dtype = (dtype_in or "").strip() or args.dtype
+                args.default_load_format = (load_format_in or "auto").strip().lower()
+                args.quant_preference = (quant_pref_in or "auto").strip().lower()
                 args.no_flash_attn = not bool(flash_attn_in)
                 args.staged_load = bool(staged_load_in)
                 args.tokenizer_on_cpu = bool(tokenizer_cpu_in)
@@ -1879,8 +2168,15 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
                 state["sanitize_logits"] = bool(sanitize_logits_in)
 
+                resolved_checkpoint, quantized_dir, load_mode = _resolve_load_selection(
+                    checkpoint,
+                    args.default_load_format,
+                    args.quant_preference,
+                )
+
                 # 加载模型
-                args.checkpoint = checkpoint
+                args.checkpoint = resolved_checkpoint
+                args.quantized_dir = quantized_dir
                 tts = _load_tts(args)
                 model_type = getattr(tts.model, "tts_model_type", "")
                 print(f"[Load] model_type={model_type} | model_device={_infer_model_device(tts.model)}")
@@ -1894,7 +2190,9 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
                     pass
 
                 state["tts"] = tts
-                state["checkpoint"] = checkpoint
+                state["checkpoint"] = resolved_checkpoint
+                state["quantized_dir"] = quantized_dir
+                state["load_format"] = load_mode
                 state["model_type"] = model_type
 
                 # 获取 speakers (仅 custom_voice 模式)
@@ -1904,10 +2202,12 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
                 status_msg = (
                     f"✅ 模型加载成功!\n"
-                    f"路径: {checkpoint}\n"
-                    f"类型: {model_type} | device={args.device} | dtype={args.dtype}"
+                    f"路径: {resolved_checkpoint}\n"
+                    f"类型: {model_type} | device={args.device} | dtype={args.dtype} | load={load_mode}"
                 )
-                sys_check = _system_check_summary(checkpoint, output_dir, model=tts)
+                if quantized_dir:
+                    status_msg += f"\n量化目录: {quantized_dir}"
+                sys_check = _system_check_summary(resolved_checkpoint, output_dir, model=tts)
 
                 quant_check = _check_quantization_status(tts) + "\n\n" + _get_tracker().format_summary()
 
@@ -1939,9 +2239,39 @@ def build_lazy_demo(args: argparse.Namespace) -> gr.Blocks:
 
         load_btn.click(
             load_model_fn,
-            inputs=[model_path_display, device_input, dtype_dropdown, flash_attn_checkbox, sanitize_logits_checkbox, staged_load_checkbox, tokenizer_cpu_checkbox],
+            inputs=[
+                model_path_display,
+                device_input,
+                dtype_dropdown,
+                load_format_dropdown,
+                quant_pref_dropdown,
+                flash_attn_checkbox,
+                sanitize_logits_checkbox,
+                staged_load_checkbox,
+                tokenizer_cpu_checkbox,
+            ],
             outputs=[model_status_text, tts_area, sys_info, quant_info, base_tab, custom_tab, design_tab, custom_speaker]
         )
+
+        if args.autoload_model and initial_path_value:
+            def _auto_load_default():
+                default_dtype = "float16" if args.dtype in ("fp16", "float16") else args.dtype
+                return load_model_fn(
+                    initial_path_value,
+                    args.device,
+                    default_dtype,
+                    args.default_load_format,
+                    args.quant_preference,
+                    not args.no_flash_attn,
+                    True,
+                    bool(args.staged_load),
+                    bool(args.tokenizer_on_cpu),
+                )
+
+            demo.load(
+                _auto_load_default,
+                outputs=[model_status_text, tts_area, sys_info, quant_info, base_tab, custom_tab, design_tab, custom_speaker],
+            )
 
         # 刷新系统检查
         def refresh_sys_check():
