@@ -160,7 +160,7 @@ if [ "${CURRENT_SWAP_KB}" -ge "${NEEDED_SWAP_KB}" ]; then
     log_skip "Swap already ${CURRENT_SWAP_MB} MB (>= ${SWAP_SIZE_MB} MB)"
 else
     log_info "Configuring ${SWAP_SIZE_MB} MB swap..."
-    SWAPFILE="/swapfile-qwen3tts"
+    SWAPFILE="/mnt/ssd/swapfile-qwen3tts"
     if [ ! -f "${SWAPFILE}" ]; then
         sudo fallocate -l ${SWAP_SIZE_MB}M "${SWAPFILE}" || \
             sudo dd if=/dev/zero of="${SWAPFILE}" bs=1M count=${SWAP_SIZE_MB} status=progress
