@@ -214,6 +214,14 @@ def quantize_torch_dynamic_int8(
     print(f"[Quantize] Target: model.talker | Linear layers: {total_linear}")
     print("[Quantize] Method: torch.ao.quantization.quantize_dynamic (INT8)")
 
+    # ARM/Jetson 平台需要显式设置 qnnpack 后端
+    supported = torch.backends.quantized.supported_engines
+    current = torch.backends.quantized.engine
+    print(f"[Quantize] Quantization backends: supported={supported}, current={current}")
+    if "qnnpack" in supported and current != "qnnpack":
+        torch.backends.quantized.engine = "qnnpack"
+        print("[Quantize] Switched quantization backend to qnnpack")
+
     t0 = time.time()
     torch.ao.quantization.quantize_dynamic(
         talker,
